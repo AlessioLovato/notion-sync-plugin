@@ -1,0 +1,36 @@
+{
+  "id": "notion-sync-plugin",
+  "name": "Notion Sync Plugin",
+  "version": "1.0.0",
+  "manifestVersion": 1,
+  "minSupVersion": "14.0.0",
+  "description": "Bidirectional sync between Super Productivity tasks and Notion databases",
+  "author": "Notion Sync Team",
+  "icon": "icon.svg",
+  "iFrame": true,
+  "sidePanel": false,
+  "permissions": [
+    "getTasks",
+    "getArchivedTasks",
+    "getCurrentContextTasks",
+    "updateTask",
+    "addTask",
+    "getAllProjects",
+    "addProject",
+    "updateProject",
+    "getAllTags",
+    "addTag",
+    "updateTag",
+    "showSnack",
+    "notify",
+    "openDialog",
+    "persistDataSynced",
+    "loadSyncedData"
+  ],
+  "hooks": [
+    "taskComplete",
+    "taskUpdate",
+    "taskDelete",
+    "currentTaskChange"
+  ]
+}

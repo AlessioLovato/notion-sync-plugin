@@ -1,0 +1,1114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notion Sync Plugin</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            margin: 0;
+            padding: 16px;
+            background: #f8f9fa;
+            color: #333;
+            line-height: 1.5;
+        }
+
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+        }
+
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 24px;
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 24px;
+            font-weight: 600;
+            color: #1f2937;
+        }
+
+        .status-indicator {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+            margin-left: auto;
+        }
+
+        .status-connected {
+            background: #dcfce7;
+            color: #166534;
+        }
+
+        .status-disconnected {
+            background: #fef2f2;
+            color: #dc2626;
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 4px;
+            font-weight: 500;
+            color: #374151;
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+
+        .form-group input:focus {
+            outline: none;
+            border-color: #6366f1;
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        .button {
+            background: #6366f1;
+            color: white;
+            border: none;
+            padding: 10px 16px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            margin-right: 8px;
+            margin-bottom: 8px;
+            transition: background-color 0.2s;
+        }
+
+        .button:hover {
+            background: #5b21b6;
+        }
+
+        .button:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+        }
+
+        .button-secondary {
+            background: #f3f4f6;
+            color: #374151;
+            border: 1px solid #d1d5db;
+        }
+
+        .button-secondary:hover {
+            background: #e5e7eb;
+        }
+
+        .log-container {
+            background: #1f2937;
+            color: #f9fafb;
+            padding: 16px;
+            border-radius: 6px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            max-height: 200px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+
+        .help-text {
+            font-size: 13px;
+            color: #6b7280;
+            margin-top: 4px;
+        }
+
+        .hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="card">
+            <div class="header">
+                <h1>Notion Sync Plugin</h1>
+                <span id="connectionStatus" class="status-indicator status-disconnected">Not Configured</span>
+            </div>
+        </div>
+
+        <!-- Configuration -->
+        <div class="card">
+            <h3>Configuration</h3>
+
+            <div class="form-group">
+                <label for="apiKey">Notion API Key *</label>
+                <input type="password" id="apiKey" placeholder="ntn_..." required>
+                <div class="help-text">Create an integration at notion.so/my-integrations</div>
+            </div>
+
+            <div class="form-group">
+                <label for="tasksDatabaseId">Tasks Database ID *</label>
+                <input type="text" id="tasksDatabaseId" placeholder="Database ID from URL" required>
+                <div class="help-text">Copy from your Notion tasks database URL</div>
+            </div>
+
+            <button id="saveConfigBtn" class="button">Save Configuration</button>
+            <button id="testConnectionBtn" class="button button-secondary" disabled>Test Connection</button>
+            <button id="manualSyncBtn" class="button button-secondary" disabled>Manual Sync</button>
+            <button id="exportConfigBtn" class="button button-secondary">Export Configuration</button>
+            <button id="importConfigBtn" class="button button-secondary">Import Configuration</button>
+            <input type="file" id="importConfigFile" accept=".json" class="hidden">
+        </div>
+
+        <!-- Log -->
+        <div class="card">
+            <h3>Log</h3>
+            <div id="syncLog" class="log-container">Plugin initialized.\n</div>
+            <button id="clearLogBtn" class="button button-secondary">Clear Log</button>
+        </div>
+    </div>
+
+    <script>
+        // Global state
+        let pluginConfig = {
+            apiKey: '',
+            tasksDatabaseId: '',
+            configured: false
+        };
+
+        // UI Elements
+        const elements = {
+            connectionStatus: document.getElementById('connectionStatus'),
+            apiKey: document.getElementById('apiKey'),
+            tasksDatabaseId: document.getElementById('tasksDatabaseId'),
+            saveConfigBtn: document.getElementById('saveConfigBtn'),
+            testConnectionBtn: document.getElementById('testConnectionBtn'),
+            manualSyncBtn: document.getElementById('manualSyncBtn'),
+            exportConfigBtn: document.getElementById('exportConfigBtn'),
+            importConfigBtn: document.getElementById('importConfigBtn'),
+            importConfigFile: document.getElementById('importConfigFile'),
+            syncLog: document.getElementById('syncLog'),
+            clearLogBtn: document.getElementById('clearLogBtn')
+        };
+
+        // Logging function
+        function log(message, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            const logEntry = `[${timestamp}] ${type.toUpperCase()}: ${message}\n`;
+            elements.syncLog.textContent += logEntry;
+            elements.syncLog.scrollTop = elements.syncLog.scrollHeight;
+            console.log(`[Notion Plugin] ${message}`);
+        }
+
+        // Update UI state
+        function updateUI() {
+            const isConfigured = pluginConfig.apiKey && pluginConfig.tasksDatabaseId && pluginConfig.configured;
+
+            // Update connection status
+            if (isConfigured) {
+                elements.connectionStatus.textContent = 'Configured';
+                elements.connectionStatus.className = 'status-indicator status-connected';
+            } else {
+                elements.connectionStatus.textContent = 'Not Configured';
+                elements.connectionStatus.className = 'status-indicator status-disconnected';
+            }
+
+            // Update form values
+            elements.apiKey.value = pluginConfig.apiKey || '';
+            elements.tasksDatabaseId.value = pluginConfig.tasksDatabaseId || '';
+
+            // Enable/disable buttons
+            elements.testConnectionBtn.disabled = !(pluginConfig.apiKey && pluginConfig.tasksDatabaseId);
+            elements.manualSyncBtn.disabled = !isConfigured;
+        }
+
+        // Load configuration from localStorage
+        function loadConfiguration() {
+            try {
+                log('Loading configuration from localStorage...');
+
+                const savedConfig = localStorage.getItem('notion-sync-config');
+                if (savedConfig) {
+                    pluginConfig = JSON.parse(savedConfig);
+                    log('Configuration loaded successfully');
+                } else {
+                    log('No saved configuration found');
+                    pluginConfig = {
+                        apiKey: '',
+                        tasksDatabaseId: '',
+                        configured: false
+                    };
+                }
+
+                updateUI();
+            } catch (error) {
+                log(`Failed to load configuration: ${error.message}`, 'error');
+                pluginConfig = {
+                    apiKey: '',
+                    tasksDatabaseId: '',
+                    configured: false
+                };
+                updateUI();
+            }
+        }
+
+        // Save configuration to localStorage
+        function saveConfiguration() {
+            try {
+                log('Saving configuration...');
+
+                const apiKey = elements.apiKey.value.trim();
+                const tasksDatabaseId = elements.tasksDatabaseId.value.trim();
+
+                if (!apiKey) {
+                    throw new Error('API Key is required');
+                }
+
+                if (!tasksDatabaseId) {
+                    throw new Error('Tasks Database ID is required');
+                }
+
+                // Validate API key format
+                if (!apiKey.startsWith('ntn_')) {
+                    throw new Error('API Key should start with "ntn_"');
+                }
+
+                // Validate database ID format (UUID with or without hyphens)
+                const uuidRegex = /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i;
+                if (!uuidRegex.test(tasksDatabaseId)) {
+                    throw new Error('Invalid Tasks Database ID format. Should be a UUID.');
+                }
+
+                // Update configuration
+                pluginConfig = {
+                    apiKey: apiKey,
+                    tasksDatabaseId: tasksDatabaseId,
+                    configured: true
+                };
+
+                // Save to localStorage
+                localStorage.setItem('notion-sync-config', JSON.stringify(pluginConfig));
+
+                updateUI();
+                log('Configuration saved successfully');
+
+                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                    PluginAPI.showSnack({
+                        msg: 'Configuration saved successfully!',
+                        type: 'SUCCESS'
+                    });
+                }
+
+            } catch (error) {
+                log(`Failed to save configuration: ${error.message}`, 'error');
+
+                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                    PluginAPI.showSnack({
+                        msg: `Save failed: ${error.message}`,
+                        type: 'ERROR'
+                    });
+                }
+            }
+        }
+
+        // Core connection test function (returns boolean)
+        async function testNotionConnection() {
+            if (!pluginConfig.apiKey || !pluginConfig.tasksDatabaseId) {
+                return false;
+            }
+
+            try {
+                // Test connection by getting database info
+                const response = await fetch(`https://api.notion.com/v1/databases/${pluginConfig.tasksDatabaseId}`, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                        'Notion-Version': '2022-06-28'
+                    }
+                });
+
+                return response.ok;
+            } catch (error) {
+                return false;
+            }
+        }
+
+        // Test connection to Notion (UI function)
+        async function testConnection() {
+            try {
+                elements.testConnectionBtn.disabled = true;
+                elements.testConnectionBtn.textContent = 'Testing...';
+
+                log('Testing Notion connection...');
+
+                if (!pluginConfig.apiKey || !pluginConfig.tasksDatabaseId) {
+                    throw new Error('API Key and Database ID are required');
+                }
+
+                // Test connection by getting database info
+                const response = await fetch(`https://api.notion.com/v1/databases/${pluginConfig.tasksDatabaseId}`, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                        'Notion-Version': '2022-06-28'
+                    }
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.text();
+                    throw new Error(`API Error (${response.status}): ${errorData}`);
+                }
+
+                const dbData = await response.json();
+
+                // Update configuration state
+                pluginConfig.configured = true;
+                saveConfiguration();
+
+                elements.connectionStatus.textContent = 'Connected';
+                elements.connectionStatus.className = 'status-indicator status-connected';
+
+                log('Connection test successful!');
+                log(`Database: ${dbData.title?.[0]?.plain_text || 'Unknown'}`);
+
+                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                    PluginAPI.showSnack({
+                        msg: 'Connection test successful!',
+                        type: 'SUCCESS'
+                    });
+                }
+
+                // Update UI state after successful connection
+                updateUI();
+
+            } catch (error) {
+                elements.connectionStatus.textContent = 'Connection Failed';
+                elements.connectionStatus.className = 'status-indicator status-disconnected';
+
+                log(`Connection test failed: ${error.message}`, 'error');
+
+                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                    PluginAPI.showSnack({
+                        msg: `Connection failed: ${error.message}`,
+                        type: 'ERROR'
+                    });
+                }
+            } finally {
+                elements.testConnectionBtn.disabled = false;
+                elements.testConnectionBtn.textContent = 'Test Connection';
+            }
+        }
+
+        // Manual sync between SP and Notion (task names only)
+        // Helper functions from plugin.js for property conversion
+        function spTaskToNotionProperties(task) {
+            const properties = {
+                'Name': {
+                    title: [{ text: { content: task.title || 'Untitled Task' } }]
+                },
+                'SP Task ID': {
+                    rich_text: [{ text: { content: task.id } }]
+                },
+                'Complete': {
+                    checkbox: task.isDone || false
+                }
+            };
+
+            // Add notes if present
+            if (task.notes) {
+                properties['Notes'] = {
+                    rich_text: [{ text: { content: task.notes } }]
+                };
+            }
+
+            // Add time estimate (convert from milliseconds to hours)
+            if (task.timeEstimate) {
+                properties['Time Estimate'] = {
+                    number: Math.round(task.timeEstimate / 3600000 * 100) / 100
+                };
+            }
+
+            // Add time spent (convert from milliseconds to hours)
+            if (task.timeSpent) {
+                properties['Time Spent'] = {
+                    number: Math.round(task.timeSpent / 3600000 * 100) / 100
+                };
+            }
+
+            // Add priority
+            if (task.priority) {
+                const priorityMap = {
+                    'URGENT': 'Urgent',
+                    'HIGH': 'High',
+                    'MEDIUM': 'Medium',
+                    'LOW': 'Low'
+                };
+                properties['Priority'] = {
+                    select: { name: priorityMap[task.priority] || 'Medium' }
+                };
+            }
+
+            // Add scheduling date
+            if (task.plannedAt || task.remindAt) {
+                const date = new Date(task.plannedAt || task.remindAt);
+                properties['Scheduling'] = {
+                    date: { start: date.toISOString().split('T')[0] }
+                };
+            }
+
+            return properties;
+        }
+
+        function notionPageToSpTask(page) {
+            const props = page.properties;
+
+            const task = {
+                title: props.Name?.title?.[0]?.text?.content || 'Untitled',
+                notes: props.Notes?.rich_text?.[0]?.text?.content || '',
+                isDone: props.Complete?.checkbox || false,
+                createdAt: new Date(page.created_time).getTime(),
+                id: props['SP Task ID']?.rich_text?.[0]?.text?.content || null
+            };
+
+            // Convert time estimate (hours to milliseconds)
+            if (props['Time Estimate']?.number) {
+                task.timeEstimate = props['Time Estimate'].number * 3600000;
+            }
+
+            // Convert time spent (hours to milliseconds)
+            if (props['Time Spent']?.number) {
+                task.timeSpent = props['Time Spent'].number * 3600000;
+            }
+
+            // Convert priority
+            if (props.Priority?.select?.name) {
+                const priorityMap = {
+                    'Urgent': 'URGENT',
+                    'High': 'HIGH',
+                    'Medium': 'MEDIUM',
+                    'Low': 'LOW'
+                };
+                task.priority = priorityMap[props.Priority.select.name] || 'MEDIUM';
+            }
+
+            // Convert scheduling date
+            if (props.Scheduling?.date?.start) {
+                const scheduledDate = new Date(props.Scheduling.date.start);
+                task.plannedAt = scheduledDate.getTime();
+            }
+
+            return task;
+        }
+
+        // Sync mappings stored in localStorage
+        function saveSyncMappings() {
+            const mappingsData = {};
+            for (const [spTaskId, notionPageId] of syncMappings.entries()) {
+                mappingsData[spTaskId] = notionPageId;
+            }
+            localStorage.setItem('notion-sync-mappings', JSON.stringify(mappingsData));
+        }
+
+        function loadSyncMappings() {
+            try {
+                const mappingsData = localStorage.getItem('notion-sync-mappings');
+                if (mappingsData) {
+                    const parsed = JSON.parse(mappingsData);
+                    syncMappings.clear();
+                    for (const [spTaskId, notionPageId] of Object.entries(parsed)) {
+                        syncMappings.set(spTaskId, notionPageId);
+                    }
+                }
+            } catch (error) {
+                log(`Failed to load sync mappings: ${error.message}`, 'error');
+            }
+        }
+
+        // Initialize sync mappings
+        const syncMappings = new Map();
+        loadSyncMappings();
+
+        // New simplified bidirectional sync function
+        async function performBidirectionalSync() {
+            if (!pluginConfig.apiKey || !pluginConfig.tasksDatabaseId || !pluginConfig.configured) {
+                throw new Error('Plugin not configured properly');
+            }
+
+            if (typeof PluginAPI === 'undefined') {
+                throw new Error('PluginAPI not available');
+            }
+
+            log('=== Starting New Sync Architecture ===');
+
+            // PHASE 1: Data Collection
+            const spTasks = await PluginAPI.getTasks();
+            const archivedTasks = await PluginAPI.getArchivedTasks();
+            const allSpTasks = [...spTasks, ...archivedTasks];
+            log(`Phase 1: Found ${spTasks.length} active SP tasks, ${archivedTasks.length} archived`);
+
+            // Get all Notion tasks
+            const notionTasks = await getAllNotionTasks();
+            log(`Phase 1: Found ${notionTasks.length} Notion tasks`);
+
+            // Create lookup maps
+            const spTasksById = new Map();
+            allSpTasks.forEach(task => spTasksById.set(task.id, task));
+
+            const notionTasksBySPId = new Map();
+            notionTasks.forEach(page => {
+                const spTaskId = page.properties['SP Task ID']?.rich_text?.[0]?.text?.content;
+                if (spTaskId) {
+                    notionTasksBySPId.set(spTaskId, page);
+                }
+            });
+
+            let stats = {
+                spToNotionCreates: 0,
+                notionToSpCreates: 0,
+                spToNotionUpdates: 0,
+                notionToSpUpdates: 0
+            };
+
+            // PHASE 2: Create Missing Tasks
+            log('=== Phase 2: Creating Missing Tasks ===');
+
+            // 2A: Create SP tasks for Notion pages without valid SP Task ID
+            for (const notionPage of notionTasks) {
+                const spTaskId = notionPage.properties['SP Task ID']?.rich_text?.[0]?.text?.content;
+
+                if (!spTaskId || !spTasksById.has(spTaskId)) {
+                    // Check if we should create this task (avoid duplicates by title)
+                    const notionTitle = notionPage.properties['Name']?.title?.[0]?.text?.content || 'Untitled';
+                    const existingByTitle = allSpTasks.find(t => t.title === notionTitle);
+
+                    if (!existingByTitle) {
+                        const newSpTask = await createSpTaskFromNotion(notionPage);
+                        stats.notionToSpCreates++;
+                        log(`Created SP task: ${newSpTask.title}`);
+                    } else {
+                        // Link existing SP task to Notion page
+                        await updateNotionTask(notionPage.id, {
+                            'SP Task ID': { rich_text: [{ text: { content: existingByTitle.id } }] }
+                        });
+                        log(`Linked existing SP task: ${existingByTitle.title}`);
+                    }
+                }
+            }
+
+            // 2B: Create Notion tasks for SP tasks not in Notion (only active tasks)
+            for (const spTask of spTasks) { // Only active tasks
+                if (!notionTasksBySPId.has(spTask.id)) {
+                    await createNotionTaskFromSp(spTask);
+                    stats.spToNotionCreates++;
+                    log(`Created Notion task: ${spTask.title}`);
+                }
+            }
+
+            // PHASE 3: Update Existing Tasks (only active tasks)
+            log('=== Phase 3: Updating Existing Active Tasks ===');
+
+            // Update only active SP tasks with their Notion counterparts
+            for (const spTask of spTasks) { // Only active SP tasks
+                const notionPage = notionTasksBySPId.get(spTask.id);
+                if (notionPage) {
+                    const updated = await updateTaskPair(spTask, notionPage);
+                    if (updated.spUpdated) stats.notionToSpUpdates++;
+                    if (updated.notionUpdated) stats.spToNotionUpdates++;
+                }
+            }
+
+            // PHASE 4: Handle SP Task Archival (mark corresponding Notion tasks as archived)
+            log('=== Phase 4: Syncing Archived Tasks ===');
+
+            for (const archivedTask of archivedTasks) {
+                // Find Notion page for this archived SP task
+                const searchResponse = await fetch(`https://api.notion.com/v1/databases/${pluginConfig.tasksDatabaseId}/query`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                        'Notion-Version': '2022-06-28',
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        filter: {
+                            property: 'SP Task ID',
+                            rich_text: { equals: archivedTask.id }
+                        }
+                    })
+                });
+
+                const searchData = await searchResponse.json();
+
+                if (searchData.results && searchData.results.length > 0) {
+                    const notionPage = searchData.results[0];
+                    const currentlyArchived = notionPage.properties['Archived']?.checkbox === true;
+
+                    if (!currentlyArchived) {
+                        // Archive the Notion task to match SP archival
+                        await updateNotionTask(notionPage.id, {
+                            'Archived': { checkbox: true },
+                            'Status': { status: { name: 'Done' } }
+                        });
+                        log(`Archived Notion task: ${archivedTask.title}`);
+                        stats.spToNotionUpdates++;
+                    }
+                }
+            }
+
+            saveSyncMappings();
+            log('=== Sync Complete ===');
+
+            return stats;
+        }
+
+        // Get all Notion tasks (filter out archived tasks at API level)
+        async function getAllNotionTasks() {
+            const response = await fetch(`https://api.notion.com/v1/databases/${pluginConfig.tasksDatabaseId}/query`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                    'Notion-Version': '2022-06-28',
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    filter: {
+                        and: [
+                            {
+                                property: 'Archived',
+                                checkbox: {
+                                    equals: false
+                                }
+                            }
+                        ]
+                    }
+                })
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(`Notion API error: ${data.message || 'Unknown error'}`);
+            }
+
+            // Also filter out page-level archived items as additional safety
+            return data.results.filter(page => !page.archived);
+        }
+
+        // Create SP task from Notion page
+        async function createSpTaskFromNotion(notionPage) {
+            const taskData = {
+                title: notionPage.properties['Name']?.title?.[0]?.text?.content || 'Untitled',
+                notes: notionPage.properties['Notes']?.rich_text?.[0]?.text?.content || '',
+                isDone: getCompletionStatusFromNotion(notionPage),
+                timeEstimate: (notionPage.properties['Time Estimate']?.number || 0) * 3600000, // hours to ms
+                timeSpent: (notionPage.properties['Time Spent']?.number || 0) * 3600000
+            };
+
+            // Handle scheduling
+            if (notionPage.properties['Scheduling']?.date?.start) {
+                taskData.plannedAt = new Date(notionPage.properties['Scheduling'].date.start).getTime();
+            }
+
+            const newTaskId = await PluginAPI.addTask(taskData);
+
+            // Update Notion page with SP Task ID
+            await updateNotionTask(notionPage.id, {
+                'SP Task ID': { rich_text: [{ text: { content: newTaskId } }] }
+            });
+
+            return { ...taskData, id: newTaskId };
+        }
+
+        // Create Notion task from SP task
+        async function createNotionTaskFromSp(spTask) {
+            const properties = {
+                'Name': { title: [{ text: { content: spTask.title || 'Untitled Task' } }] },
+                'SP Task ID': { rich_text: [{ text: { content: spTask.id } }] },
+                'Archived': { checkbox: false }, // New tasks are never archived
+                'Status': { status: { name: getNotionStatusFromSp(spTask) } }
+            };
+
+            // Add optional properties
+            if (spTask.notes) {
+                properties['Notes'] = { rich_text: [{ text: { content: spTask.notes } }] };
+            }
+
+            if (spTask.timeEstimate) {
+                properties['Time Estimate'] = { number: Math.round(spTask.timeEstimate / 3600000 * 100) / 100 };
+            }
+
+            if (spTask.timeSpent) {
+                properties['Time Spent'] = { number: Math.round(spTask.timeSpent / 3600000 * 100) / 100 };
+            }
+
+            if (spTask.plannedAt) {
+                properties['Scheduling'] = { date: { start: new Date(spTask.plannedAt).toISOString().split('T')[0] } };
+            }
+
+            return await createNotionTask(properties);
+        }
+
+        // Update task pair (SP ↔ Notion) - only for active tasks
+        async function updateTaskPair(spTask, notionPage) {
+            let spUpdated = false;
+            let notionUpdated = false;
+
+            // Get current Notion status
+            const notionStatus = notionPage.properties['Status']?.status?.name;
+            const notionComplete = getCompletionStatusFromNotion(notionPage);
+
+            // Handle Status field rules
+            if (notionStatus === 'Aborted' && !spTask.isDone) {
+                // Rule: Aborted in Notion → Complete in SP
+                await updateSpTask(spTask.id, { isDone: true });
+                spUpdated = true;
+                log(`Marked SP task as completed (Aborted): ${spTask.title}`);
+            } else if (spTask.isDone !== notionComplete) {
+                // Sync completion status
+                await updateNotionTask(notionPage.id, {
+                    'Status': { status: { name: getNotionStatusFromSp(spTask) } }
+                });
+                notionUpdated = true;
+                log(`Updated Notion completion status: ${spTask.title}`);
+            } else {
+                // Update Status based on time spent
+                const expectedStatus = getNotionStatusFromSp(spTask);
+                if (notionStatus !== expectedStatus) {
+                    await updateNotionTask(notionPage.id, {
+                        'Status': { status: { name: expectedStatus } }
+                    });
+                    notionUpdated = true;
+                    log(`Updated Notion status to ${expectedStatus}: ${spTask.title}`);
+                }
+            }
+
+            // Update other fields (scheduling, time tracking)
+            // Sync scheduling
+            const notionScheduling = notionPage.properties['Scheduling']?.date?.start;
+            const spScheduling = spTask.plannedAt ? new Date(spTask.plannedAt).toISOString().split('T')[0] : null;
+
+            if (notionScheduling !== spScheduling) {
+                if (spScheduling) {
+                    await updateNotionTask(notionPage.id, {
+                        'Scheduling': { date: { start: spScheduling } }
+                    });
+                    notionUpdated = true;
+                }
+            }
+
+            return { spUpdated, notionUpdated };
+        }
+
+        // Helper functions for Status field mapping
+        function getNotionStatusFromSp(spTask) {
+            if (spTask.isDone) return 'Done';
+            if (spTask.timeSpent > 0) return 'In progress';
+            return 'Not started';
+        }
+
+        function getCompletionStatusFromNotion(notionPage) {
+            const status = notionPage.properties['Status']?.status?.name;
+
+            // Task is complete if Status is 'Done' or 'Aborted'
+            return status === 'Done' || status === 'Aborted';
+        }
+
+        function getArchivedStatusFromNotion(notionPage) {
+            return notionPage.properties['Archived']?.checkbox === true;
+        }
+
+        // Reusable update functions
+        async function updateSpTask(taskId, updates) {
+            await PluginAPI.updateTask(taskId, updates);
+        }
+
+        // Helper functions
+        function getSpTaskUpdates(currentTask, newTaskData) {
+            const updates = {};
+
+            if (currentTask.title !== newTaskData.title) updates.title = newTaskData.title;
+            if (currentTask.notes !== newTaskData.notes) updates.notes = newTaskData.notes;
+            if (currentTask.isDone !== newTaskData.isDone) updates.isDone = newTaskData.isDone;
+            if (currentTask.timeEstimate !== newTaskData.timeEstimate) updates.timeEstimate = newTaskData.timeEstimate;
+            if (currentTask.timeSpent !== newTaskData.timeSpent) updates.timeSpent = newTaskData.timeSpent;
+            if (currentTask.priority !== newTaskData.priority) updates.priority = newTaskData.priority;
+            if (currentTask.plannedAt !== newTaskData.plannedAt) updates.plannedAt = newTaskData.plannedAt;
+
+            return updates;
+        }
+
+        async function createNotionTask(properties) {
+            const response = await fetch('https://api.notion.com/v1/pages', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                    'Notion-Version': '2022-06-28',
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    parent: { database_id: pluginConfig.tasksDatabaseId },
+                    properties
+                })
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to create Notion task: ${response.statusText}`);
+            }
+
+            return await response.json();
+        }
+
+        async function updateNotionTask(pageId, properties) {
+            const response = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+                method: 'PATCH',
+                headers: {
+                    'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                    'Notion-Version': '2022-06-28',
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ properties })
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to update Notion task: ${response.statusText}`);
+            }
+
+            return await response.json();
+        }
+
+        async function archiveNotionTask(pageId) {
+            const response = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+                method: 'PATCH',
+                headers: {
+                    'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                    'Notion-Version': '2022-06-28',
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ archived: true })
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to archive Notion task: ${response.statusText}`);
+            }
+
+            return await response.json();
+        }
+
+        // Manual sync function (calls the common sync function)
+        async function performManualSync() {
+            try {
+                elements.manualSyncBtn.disabled = true;
+                elements.manualSyncBtn.textContent = 'Syncing...';
+
+                log('Starting manual bidirectional sync...');
+
+                const results = await performBidirectionalSync();
+
+                log(`Manual sync completed. SP→Notion: ${results.spToNotionUpdates} updated, ${results.spToNotionCreates} created. Notion→SP: ${results.notionToSpUpdates} updated, ${results.notionToSpCreates} created. ${results.archivals} archived.`);
+
+                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                    PluginAPI.showSnack({
+                        msg: `Sync completed! SP→Notion: ${results.spToNotionUpdates + results.spToNotionCreates}, Notion→SP: ${results.notionToSpUpdates + results.notionToSpCreates}, Archived: ${results.archivals}`,
+                        type: 'SUCCESS'
+                    });
+                }
+
+            } catch (error) {
+                log(`Manual sync failed: ${error.message}`, 'error');
+
+                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                    PluginAPI.showSnack({
+                        msg: `Sync failed: ${error.message}`,
+                        type: 'ERROR'
+                    });
+                }
+            } finally {
+                elements.manualSyncBtn.disabled = false;
+                elements.manualSyncBtn.textContent = 'Manual Sync';
+            }
+        }
+
+        // Export configuration to file
+        async function exportConfiguration() {
+            try {
+                if (!pluginConfig.configured) {
+                    throw new Error('No configuration to export. Please save configuration first.');
+                }
+
+                const exportData = {
+                    version: "1.0.0",
+                    exportDate: new Date().toISOString(),
+                    configuration: {
+                        apiKey: pluginConfig.apiKey, // Export real API key
+                        tasksDatabaseId: pluginConfig.tasksDatabaseId,
+                        configured: pluginConfig.configured
+                    }
+                };
+
+                const configStr = JSON.stringify(exportData, null, 2);
+
+                // Try to use File System Access API for better file dialog
+                if ('showSaveFilePicker' in window) {
+                    try {
+                        const fileHandle = await window.showSaveFilePicker({
+                            suggestedName: `notion-sync-config-${new Date().toISOString().split('T')[0]}.json`,
+                            types: [{
+                                description: 'JSON files',
+                                accept: {'application/json': ['.json']},
+                            }],
+                        });
+
+                        const writable = await fileHandle.createWritable();
+                        await writable.write(configStr);
+                        await writable.close();
+
+                        log('Configuration exported to chosen location');
+                    } catch (err) {
+                        if (err.name === 'AbortError') {
+                            log('Export cancelled by user');
+                            return;
+                        } else {
+                            throw err;
+                        }
+                    }
+                } else {
+                    // Fallback to browser download
+                    const blob = new Blob([configStr], { type: 'application/json' });
+                    const link = document.createElement('a');
+                    link.href = URL.createObjectURL(blob);
+                    link.download = `notion-sync-config-${new Date().toISOString().split('T')[0]}.json`;
+                    link.click();
+                    log('Configuration exported to downloads folder');
+                }
+
+                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                    PluginAPI.showSnack({
+                        msg: 'Configuration exported successfully',
+                        type: 'SUCCESS'
+                    });
+                }
+
+            } catch (error) {
+                log(`Failed to export configuration: ${error.message}`, 'error');
+
+                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                    PluginAPI.showSnack({
+                        msg: `Export failed: ${error.message}`,
+                        type: 'ERROR'
+                    });
+                }
+            }
+        }
+
+        // Import configuration from file
+        function importConfiguration() {
+            elements.importConfigFile.click();
+        }
+
+        // Handle configuration file import
+        elements.importConfigFile.addEventListener('change', async (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            try {
+                const text = await file.text();
+                const importData = JSON.parse(text);
+
+                // Validate import format
+                if (!importData.configuration) {
+                    throw new Error('Invalid configuration file format.');
+                }
+
+                const importConfig = importData.configuration;
+
+                // Import both API key and database ID
+                elements.apiKey.value = importConfig.apiKey || '';
+                elements.tasksDatabaseId.value = importConfig.tasksDatabaseId || '';
+
+                log(`Configuration imported from ${file.name}`);
+                log('Please verify the configuration and save if needed');
+
+                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                    PluginAPI.showSnack({
+                        msg: 'Configuration imported successfully.',
+                        type: 'SUCCESS'
+                    });
+                }
+
+            } catch (error) {
+                log(`Failed to import configuration: ${error.message}`, 'error');
+
+                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                    PluginAPI.showSnack({
+                        msg: `Import failed: ${error.message}`,
+                        type: 'ERROR'
+                    });
+                }
+            }
+
+            event.target.value = '';
+        });
+
+        // Clear log
+        function clearLog() {
+            elements.syncLog.textContent = 'Log cleared.\n';
+            log('Log cleared');
+        }
+
+        // Event listeners
+        elements.saveConfigBtn.addEventListener('click', saveConfiguration);
+        elements.testConnectionBtn.addEventListener('click', testConnection);
+        elements.manualSyncBtn.addEventListener('click', performManualSync);
+        elements.exportConfigBtn.addEventListener('click', exportConfiguration);
+        elements.importConfigBtn.addEventListener('click', importConfiguration);
+        elements.clearLogBtn.addEventListener('click', clearLog);
+
+        // Initialize
+        async function initialize() {
+            log('Notion Sync Plugin UI initialized');
+            loadConfiguration();
+
+            // Auto-connect if configuration exists
+            if (pluginConfig.apiKey && pluginConfig.tasksDatabaseId) {
+                log('Configuration found, attempting auto-connect...');
+                await autoConnect();
+            }
+        }
+
+        // Auto-connect function
+        async function autoConnect() {
+            try {
+                const isConnected = await testNotionConnection();
+                if (isConnected) {
+                    pluginConfig.configured = true;
+                    saveConfiguration();
+                    updateUI();
+                    log('Auto-connect successful');
+                } else {
+                    log('Auto-connect failed: Invalid credentials or database', 'error');
+                }
+            } catch (error) {
+                log(`Auto-connect failed: ${error.message}`, 'error');
+            }
+        }
+
+        initialize();
+    </script>
+</body>
+</html>
