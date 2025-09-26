@@ -595,18 +595,40 @@
                 if (!spTaskId || !spTasksById.has(spTaskId)) {
                     // Check if we should create this task (avoid duplicates by title)
                     const notionTitle = notionPage.properties['Name']?.title?.[0]?.text?.content || 'Untitled';
-                    const existingByTitle = allSpTasks.find(t => t.title === notionTitle);
+                    const existingActiveTask = spTasks.find(t => t.title === notionTitle);
+                    const existingArchivedTask = archivedTasks.find(t => t.title === notionTitle);
 
-                    if (!existingByTitle) {
+                    if (existingActiveTask) {
+                        // Link existing active SP task to Notion page
+                        await updateNotionTask(notionPage.id, {
+                            'SP Task ID': { rich_text: [{ text: { content: existingActiveTask.id } }] }
+                        });
+                        log(`Linked existing active SP task: ${existingActiveTask.title}`);
+                    } else if (existingArchivedTask) {
+                        // Restore archived task: create new active task based on archived one
+                        const restoredTaskData = {
+                            title: existingArchivedTask.title,
+                            notes: existingArchivedTask.notes || '',
+                            isDone: false, // Restore as active task
+                            timeEstimate: existingArchivedTask.timeEstimate || 0,
+                            timeSpent: existingArchivedTask.timeSpent || 0,
+                            plannedAt: existingArchivedTask.plannedAt
+                        };
+
+                        const newTaskId = await PluginAPI.addTask(restoredTaskData);
+
+                        // Link new task to Notion page
+                        await updateNotionTask(notionPage.id, {
+                            'SP Task ID': { rich_text: [{ text: { content: newTaskId } }] }
+                        });
+
+                        stats.notionToSpCreates++;
+                        log(`Restored SP task from archive: ${existingArchivedTask.title}`);
+                    } else {
+                        // Create completely new task
                         const newSpTask = await createSpTaskFromNotion(notionPage);
                         stats.notionToSpCreates++;
                         log(`Created SP task: ${newSpTask.title}`);
-                    } else {
-                        // Link existing SP task to Notion page
-                        await updateNotionTask(notionPage.id, {
-                            'SP Task ID': { rich_text: [{ text: { content: existingByTitle.id } }] }
-                        });
-                        log(`Linked existing SP task: ${existingByTitle.title}`);
                     }
                 }
             }
@@ -720,9 +742,21 @@
                 timeSpent: (notionPage.properties['Time Spent']?.number || 0) * 3600000
             };
 
-            // Handle scheduling
-            if (notionPage.properties['Scheduling']?.date?.start) {
-                taskData.plannedAt = new Date(notionPage.properties['Scheduling'].date.start).getTime();
+            // Handle enhanced scheduling (plannedAt and timeEstimate)
+            const schedulingData = notionPage.properties['Scheduling']?.date;
+            if (schedulingData?.start) {
+                taskData.plannedAt = new Date(schedulingData.start).getTime();
+
+                // If Notion has end time, calculate timeEstimate
+                if (schedulingData.end) {
+                    const startTime = new Date(schedulingData.start).getTime();
+                    const endTime = new Date(schedulingData.end).getTime();
+                    const calculatedTimeEstimate = endTime - startTime;
+
+                    if (calculatedTimeEstimate > 0) {
+                        taskData.timeEstimate = calculatedTimeEstimate;
+                    }
+                }
             }
 
             const newTaskId = await PluginAPI.addTask(taskData);
@@ -758,57 +792,247 @@
             }
 
             if (spTask.plannedAt) {
-                properties['Scheduling'] = { date: { start: new Date(spTask.plannedAt).toISOString().split('T')[0] } };
+                let schedulingData = {
+                    start: new Date(spTask.plannedAt).toISOString()
+                };
+
+                // If SP has time estimate, add end time for full date range
+                if (spTask.timeEstimate && spTask.timeEstimate > 0) {
+                    const endTime = new Date(spTask.plannedAt + spTask.timeEstimate);
+                    schedulingData.end = endTime.toISOString();
+                }
+
+                properties['Scheduling'] = { date: schedulingData };
             }
 
             return await createNotionTask(properties);
         }
 
-        // Update task pair (SP ↔ Notion) - only for active tasks
+        // Update task pair (SP ↔ Notion) - Clean bidirectional sync with proper timestamp comparison
         async function updateTaskPair(spTask, notionPage) {
             let spUpdated = false;
             let notionUpdated = false;
 
-            // Get current Notion status
-            const notionStatus = notionPage.properties['Status']?.status?.name;
-            const notionComplete = getCompletionStatusFromNotion(notionPage);
+            // Get timestamps for comparison
+            const notionTimestamp = new Date(notionPage.last_edited_time).getTime(); // ISO → Unix ms
+            const spTimestamp = spTask.modified || spTask.created || 0; // SP Unix timestamp in ms
 
-            // Handle Status field rules
-            if (notionStatus === 'Aborted' && !spTask.isDone) {
-                // Rule: Aborted in Notion → Complete in SP
-                await updateSpTask(spTask.id, { isDone: true });
-                spUpdated = true;
-                log(`Marked SP task as completed (Aborted): ${spTask.title}`);
-            } else if (spTask.isDone !== notionComplete) {
-                // Sync completion status
-                await updateNotionTask(notionPage.id, {
-                    'Status': { status: { name: getNotionStatusFromSp(spTask) } }
-                });
-                notionUpdated = true;
-                log(`Updated Notion completion status: ${spTask.title}`);
+            log(`🕐 Comparing timestamps for "${spTask.title}":`);
+            log(`   SP modified: ${new Date(spTimestamp).toISOString()} (${spTimestamp})`);
+            log(`   Notion last_edited_time: ${notionPage.last_edited_time} (${notionTimestamp})`);
+
+            // Determine which side was modified more recently
+            if (notionTimestamp > spTimestamp) {
+                // Notion was modified more recently → Update SP from Notion
+                log(`⬅️ Notion → SP: ${spTask.title} (Notion newer)`);
+                spUpdated = await updateSpFromNotion(spTask, notionPage);
+            } else if (spTimestamp > notionTimestamp) {
+                // SP was modified more recently → Update Notion from SP
+                log(`➡️ SP → Notion: ${spTask.title} (SP newer)`);
+                notionUpdated = await updateNotionFromSp(spTask, notionPage);
             } else {
-                // Update Status based on time spent
-                const expectedStatus = getNotionStatusFromSp(spTask);
-                if (notionStatus !== expectedStatus) {
-                    await updateNotionTask(notionPage.id, {
-                        'Status': { status: { name: expectedStatus } }
-                    });
-                    notionUpdated = true;
-                    log(`Updated Notion status to ${expectedStatus}: ${spTask.title}`);
+                // Timestamps are equal → no update needed
+                log(`⏸️ No update needed: ${spTask.title} (timestamps equal)`);
+            }
+
+            return { spUpdated, notionUpdated };
+        }
+
+        // Update SP task from Notion (when Notion was modified more recently)
+        async function updateSpFromNotion(spTask, notionPage) {
+            const updates = {};
+
+            // Get Notion data
+            const notionStatus = notionPage.properties['Status']?.status?.name;
+            const notionTitle = notionPage.properties['Name']?.title?.[0]?.text?.content || spTask.title;
+            const notionNotes = notionPage.properties['Notes']?.rich_text?.[0]?.text?.content || '';
+
+            // Determine completion status from Notion
+            let notionComplete = false;
+            if (notionStatus === 'Done') {
+                notionComplete = true;
+            } else if (notionStatus === 'Aborted') {
+                notionComplete = true; // Aborted tasks are considered completed in SP
+            } else if (notionStatus === 'In progress') {
+                // In progress tasks should be active (not completed) in SP
+                notionComplete = false;
+            } else if (notionStatus === 'Not started') {
+                // Not started tasks should be active (not completed) in SP
+                notionComplete = false;
+            }
+
+            // Update fields if different
+            if (spTask.title !== notionTitle) {
+                updates.title = notionTitle;
+            }
+
+            if ((spTask.notes || '') !== notionNotes) {
+                updates.notes = notionNotes;
+            }
+
+            if (spTask.isDone !== notionComplete) {
+                updates.isDone = notionComplete;
+                if (notionStatus === 'In progress' && spTask.isDone) {
+                    log(`   Setting SP task as active (Notion: In progress)`);
                 }
             }
 
-            // Update other fields (scheduling, time tracking)
-            // Sync scheduling
-            const notionScheduling = notionPage.properties['Scheduling']?.date?.start;
-            const spScheduling = spTask.plannedAt ? new Date(spTask.plannedAt).toISOString().split('T')[0] : null;
+            // Special case: If Notion shows "Not started" but SP has time spent > 0,
+            // we should update Notion status to "In progress" on the next SP→Notion sync
+            if (notionStatus === 'Not started' && (spTask.timeSpent || 0) > 0) {
+                log(`   ⚠️ Notion shows "Not started" but SP has time spent (${(spTask.timeSpent / 3600000).toFixed(2)}h). Will update Notion to "In progress" on next sync.`);
+            }
 
-            if (notionScheduling !== spScheduling) {
-                if (spScheduling) {
+            // Apply updates if any
+            if (Object.keys(updates).length > 0) {
+                await updateSpTask(spTask.id, updates);
+                log(`✓ Updated SP: ${spTask.title} (${Object.keys(updates).join(', ')})`);
+                return true;
+            }
+
+            return false;
+        }
+
+        // Update Notion task from SP (when SP was modified more recently)
+        async function updateNotionFromSp(spTask, notionPage) {
+            const properties = {};
+
+            // Get current Notion values
+            const currentTitle = notionPage.properties['Name']?.title?.[0]?.text?.content || '';
+            const currentNotes = notionPage.properties['Notes']?.rich_text?.[0]?.text?.content || '';
+            const currentStatus = notionPage.properties['Status']?.status?.name;
+
+            // Update title if different
+            if (spTask.title !== currentTitle) {
+                properties['Name'] = { title: [{ text: { content: spTask.title } }] };
+            }
+
+            // Update notes if different
+            const spNotes = spTask.notes || '';
+            if (spNotes !== currentNotes) {
+                properties['Notes'] = { rich_text: [{ text: { content: spNotes } }] };
+            }
+
+            // Update status based on SP state
+            let expectedStatus = getNotionStatusFromSp(spTask);
+
+            // Special override: If Notion shows "Not started" but SP has time spent > 0,
+            // force status to "In progress" regardless of other SP state
+            if (currentStatus === 'Not started' && (spTask.timeSpent || 0) > 0 && !spTask.isDone) {
+                expectedStatus = 'In progress';
+                log(`   🔄 Overriding status: "Not started" → "In progress" (SP has ${(spTask.timeSpent / 3600000).toFixed(2)}h time spent)`);
+            }
+
+            if (expectedStatus !== currentStatus) {
+                properties['Status'] = { status: { name: expectedStatus } };
+            }
+
+            // Apply updates if any
+            if (Object.keys(properties).length > 0) {
+                await updateNotionTask(notionPage.id, properties);
+                log(`✓ Updated Notion: ${spTask.title} (${Object.keys(properties).join(', ')})`);
+                return true;
+            }
+
+            return false;
+        }
+
+        // Enhanced scheduling sync with start/end times and time estimates
+        async function syncSchedulingField(spTask, notionPage) {
+            const notionScheduling = notionPage.properties['Scheduling']?.date;
+            let spUpdated = false;
+            let notionUpdated = false;
+
+            // SP → Notion: Create date range if SP has plannedAt and timeEstimate
+            if (spTask.plannedAt) {
+                const startTime = new Date(spTask.plannedAt);
+
+                // Determine if we should include time or use date-only
+                const hasTimeEstimate = spTask.timeEstimate && spTask.timeEstimate > 0;
+
+                let schedulingData;
+
+                if (hasTimeEstimate) {
+                    // Has time estimate - include time
+                    const endTime = new Date(spTask.plannedAt + spTask.timeEstimate);
+                    schedulingData = {
+                        start: startTime.toISOString(),
+                        end: endTime.toISOString(),
+                        time_zone: null // Let Notion handle timezone
+                    };
+                } else {
+                    // No time estimate - date only (fixes 2am issue)
+                    schedulingData = {
+                        start: startTime.toISOString().split('T')[0], // Date only (YYYY-MM-DD)
+                        time_zone: null
+                    };
+                }
+
+                // Check if Notion scheduling needs update
+                const currentStart = notionScheduling?.start;
+                const currentEnd = notionScheduling?.end;
+
+                // Compare dates properly: normalize both to same format for comparison
+                let needsUpdate = false;
+
+                if (hasTimeEstimate) {
+                    // Comparing full datetime format
+                    const normalizedCurrentStart = currentStart ? new Date(currentStart).toISOString() : null;
+                    const normalizedNewStart = schedulingData.start;
+                    const normalizedCurrentEnd = currentEnd ? new Date(currentEnd).toISOString() : null;
+                    const normalizedNewEnd = schedulingData.end;
+
+                    needsUpdate = normalizedCurrentStart !== normalizedNewStart ||
+                                  normalizedCurrentEnd !== normalizedNewEnd;
+                } else {
+                    // Comparing date-only format (YYYY-MM-DD)
+                    const currentDateOnly = currentStart ? currentStart.split('T')[0] : null;
+                    const newDateOnly = schedulingData.start; // Already in YYYY-MM-DD format
+
+                    needsUpdate = currentDateOnly !== newDateOnly || currentEnd !== null;
+                }
+
+                if (needsUpdate) {
                     await updateNotionTask(notionPage.id, {
-                        'Scheduling': { date: { start: spScheduling } }
+                        'Scheduling': { date: schedulingData }
                     });
                     notionUpdated = true;
+                    log(`Updated Notion scheduling: ${spTask.title} (${schedulingData.start}${schedulingData.end ? ' → ' + schedulingData.end : ''}) hasTime: ${hasTimeEstimate}`);
+                }
+            } else if (notionScheduling?.start) {
+                // Clear Notion scheduling if SP has no plannedAt
+                await updateNotionTask(notionPage.id, {
+                    'Scheduling': { date: null }
+                });
+                notionUpdated = true;
+                log(`Cleared Notion scheduling: ${spTask.title}`);
+            }
+
+            // Notion → SP: Extract plannedAt and timeEstimate from Notion scheduling
+            if (notionScheduling?.start) {
+                const notionStart = new Date(notionScheduling.start).getTime();
+                let updates = {};
+
+                // Update plannedAt if different
+                if (spTask.plannedAt !== notionStart) {
+                    updates.plannedAt = notionStart;
+                }
+
+                // Calculate and update timeEstimate if Notion has end time
+                if (notionScheduling.end) {
+                    const notionEnd = new Date(notionScheduling.end).getTime();
+                    const calculatedTimeEstimate = notionEnd - notionStart;
+
+                    if (calculatedTimeEstimate > 0 && spTask.timeEstimate !== calculatedTimeEstimate) {
+                        updates.timeEstimate = calculatedTimeEstimate;
+                    }
+                }
+
+                // Apply updates if any
+                if (Object.keys(updates).length > 0) {
+                    await updateSpTask(spTask.id, updates);
+                    spUpdated = true;
+                    log(`Updated SP scheduling: ${spTask.title} (${Object.keys(updates).join(', ')})`);
                 }
             }
 

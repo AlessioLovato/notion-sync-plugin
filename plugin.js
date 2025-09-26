@@ -553,13 +553,29 @@ async function syncSingleTaskCompletion(task) {
       const pageId = searchResponse.results[0].id;
 
       // Update with completion status and Status='Done' (but not archived yet)
+      const currentDateTime = new Date().toLocaleString('en-US', {
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true
+      });
+
       const properties = {
-        'Status': { status: { name: 'Done' } }
+        'Status': { status: { name: 'Done' } },
+        'Last edited time': { rich_text: [{ text: { content: currentDateTime } }] }
         // Note: Archived checkbox will be set to true later when SP actually archives the task
       };
 
       // Update Notion with the completion status
       await notionRequest(`pages/${pageId}`, 'PATCH', { properties });
+
+      // Update our sync timestamp for this task
+      const syncState = JSON.parse(localStorage.getItem('notionSyncState') || '{}');
+      if (!syncState.taskTimestamps) syncState.taskTimestamps = {};
+      syncState.taskTimestamps[task.id] = Date.now();
+      localStorage.setItem('notionSyncState', JSON.stringify(syncState));
 
       console.log('Successfully synced task completion to Notion with Status=Done:', task.title);
 
