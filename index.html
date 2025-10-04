@@ -168,7 +168,14 @@
                 <div class="help-text">Copy from your Notion tasks database URL</div>
             </div>
 
+            <div class="form-group">
+                <label for="projectsDatabaseId">Projects Database ID</label>
+                <input type="text" id="projectsDatabaseId" placeholder="Database ID for Projects">
+                <div class="help-text">Optional: For syncing SP Projects with Notion Projects</div>
+            </div>
+
             <button id="saveConfigBtn" class="button">Save Configuration</button>
+            <button id="discoverDbBtn" class="button button-secondary" disabled>Discover Databases</button>
             <button id="testConnectionBtn" class="button button-secondary" disabled>Test Connection</button>
             <button id="manualSyncBtn" class="button button-secondary" disabled>Manual Sync</button>
             <button id="exportConfigBtn" class="button button-secondary">Export Configuration</button>
@@ -189,6 +196,7 @@
         let pluginConfig = {
             apiKey: '',
             tasksDatabaseId: '',
+            projectsDatabaseId: '',
             configured: false
         };
 
@@ -197,7 +205,9 @@
             connectionStatus: document.getElementById('connectionStatus'),
             apiKey: document.getElementById('apiKey'),
             tasksDatabaseId: document.getElementById('tasksDatabaseId'),
+            projectsDatabaseId: document.getElementById('projectsDatabaseId'),
             saveConfigBtn: document.getElementById('saveConfigBtn'),
+            discoverDbBtn: document.getElementById('discoverDbBtn'),
             testConnectionBtn: document.getElementById('testConnectionBtn'),
             manualSyncBtn: document.getElementById('manualSyncBtn'),
             exportConfigBtn: document.getElementById('exportConfigBtn'),
@@ -232,8 +242,10 @@
             // Update form values
             elements.apiKey.value = pluginConfig.apiKey || '';
             elements.tasksDatabaseId.value = pluginConfig.tasksDatabaseId || '';
+            elements.projectsDatabaseId.value = pluginConfig.projectsDatabaseId || '';
 
             // Enable/disable buttons
+            elements.discoverDbBtn.disabled = !pluginConfig.apiKey;
             elements.testConnectionBtn.disabled = !(pluginConfig.apiKey && pluginConfig.tasksDatabaseId);
             elements.manualSyncBtn.disabled = !isConfigured;
         }
@@ -275,13 +287,10 @@
 
                 const apiKey = elements.apiKey.value.trim();
                 const tasksDatabaseId = elements.tasksDatabaseId.value.trim();
+                const projectsDatabaseId = elements.projectsDatabaseId.value.trim();
 
                 if (!apiKey) {
                     throw new Error('API Key is required');
-                }
-
-                if (!tasksDatabaseId) {
-                    throw new Error('Tasks Database ID is required');
                 }
 
                 // Validate API key format
@@ -289,17 +298,21 @@
                     throw new Error('API Key should start with "ntn_"');
                 }
 
-                // Validate database ID format (UUID with or without hyphens)
+                // Validate database ID format if provided (UUID with or without hyphens)
                 const uuidRegex = /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i;
-                if (!uuidRegex.test(tasksDatabaseId)) {
+                if (tasksDatabaseId && !uuidRegex.test(tasksDatabaseId)) {
                     throw new Error('Invalid Tasks Database ID format. Should be a UUID.');
+                }
+                if (projectsDatabaseId && !uuidRegex.test(projectsDatabaseId)) {
+                    throw new Error('Invalid Projects Database ID format. Should be a UUID.');
                 }
 
                 // Update configuration
                 pluginConfig = {
                     apiKey: apiKey,
-                    tasksDatabaseId: tasksDatabaseId,
-                    configured: true
+                    tasksDatabaseId: tasksDatabaseId || '',
+                    projectsDatabaseId: projectsDatabaseId || '',
+                    configured: !!(apiKey && tasksDatabaseId) // Only configured if both API key and tasks DB are present
                 };
 
                 // Save to localStorage
@@ -415,6 +428,260 @@
             }
         }
 
+        // Manual database discovery (UI function)
+        async function discoverDatabases() {
+            try {
+                elements.discoverDbBtn.disabled = true;
+                elements.discoverDbBtn.textContent = 'Discovering...';
+
+                log('Starting manual database discovery...');
+
+                if (!pluginConfig.apiKey) {
+                    throw new Error('API Key is required');
+                }
+
+                // Save current API key first
+                pluginConfig.apiKey = elements.apiKey.value.trim();
+
+                // Trigger database discovery
+                await initializeDatabaseIds();
+
+                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                    PluginAPI.showSnack({
+                        msg: 'Database discovery completed! Check the log for results.',
+                        type: 'SUCCESS'
+                    });
+                }
+
+            } catch (error) {
+                log(`Database discovery failed: ${error.message}`, 'error');
+
+                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                    PluginAPI.showSnack({
+                        msg: `Discovery failed: ${error.message}`,
+                        type: 'ERROR'
+                    });
+                }
+            } finally {
+                elements.discoverDbBtn.disabled = !pluginConfig.apiKey;
+                elements.discoverDbBtn.textContent = 'Discover Databases';
+            }
+        }
+
+        // ===== DATABASE DISCOVERY FUNCTIONS =====
+
+        // Search for databases by title
+        async function searchNotionDatabases(apiKey) {
+            try {
+                log('Searching for Notion databases...');
+
+                const response = await fetch('https://api.notion.com/v1/search', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Notion-Version': '2022-06-28',
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        filter: {
+                            value: 'database',
+                            property: 'object'
+                        },
+                        page_size: 100
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Search API error: ${response.status}`);
+                }
+
+                const data = await response.json();
+                return data.results || [];
+            } catch (error) {
+                log(`Database search failed: ${error.message}`, 'error');
+                return [];
+            }
+        }
+
+        // Automatically discover database IDs by searching for common names
+        async function discoverDatabaseIds(apiKey) {
+            log('=== Auto-discovering Database IDs ===');
+
+            const databases = await searchNotionDatabases(apiKey);
+            const discoveries = {};
+
+            log(`Found ${databases.length} databases. Searching for tasks and projects databases...`);
+
+            // Search patterns for different database types
+            const searchPatterns = {
+                tasks: ['task', 'todo', 'to-do', 'activity', 'action', 'item'],
+                projects: ['project', 'projects']
+            };
+
+            for (const db of databases) {
+                const title = db.title?.[0]?.plain_text?.toLowerCase() || '';
+                const dbId = db.id;
+
+                log(`Checking database: "${title}" (${dbId})`);
+
+                // Check for tasks database
+                if (!discoveries.tasks && searchPatterns.tasks.some(pattern => title.includes(pattern))) {
+                    // Verify it has expected fields
+                    const hasRequiredFields = await verifyTasksDatabase(apiKey, dbId);
+                    if (hasRequiredFields) {
+                        discoveries.tasks = dbId;
+                        log(`✅ Found Tasks database: "${title}" (${dbId})`);
+                    }
+                }
+
+                // Check for projects database
+                if (!discoveries.projects && searchPatterns.projects.some(pattern => title.includes(pattern))) {
+                    // Verify it has expected fields
+                    const hasRequiredFields = await verifyProjectsDatabase(apiKey, dbId);
+                    if (hasRequiredFields) {
+                        discoveries.projects = dbId;
+                        log(`✅ Found Projects database: "${title}" (${dbId})`);
+                    }
+                }
+            }
+
+            return discoveries;
+        }
+
+        // Verify that a database has the expected structure for tasks
+        async function verifyTasksDatabase(apiKey, databaseId) {
+            try {
+                const response = await fetch(`https://api.notion.com/v1/databases/${databaseId}`, {
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Notion-Version': '2022-06-28'
+                    }
+                });
+
+                if (!response.ok) return false;
+
+                const db = await response.json();
+                const props = db.properties || {};
+
+                // Check for required fields
+                const hasName = props['Name']?.type === 'title';
+                const hasSpTaskId = props['SP Task ID']?.type === 'rich_text';
+                const hasStatus = props['Status']?.type === 'status';
+
+                return hasName && hasSpTaskId && hasStatus;
+            } catch (error) {
+                return false;
+            }
+        }
+
+        // Verify that a database has the expected structure for projects
+        async function verifyProjectsDatabase(apiKey, databaseId) {
+            try {
+                const response = await fetch(`https://api.notion.com/v1/databases/${databaseId}`, {
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Notion-Version': '2022-06-28'
+                    }
+                });
+
+                if (!response.ok) return false;
+
+                const db = await response.json();
+                const props = db.properties || {};
+
+                // Check for required fields (simpler than tasks database)
+                const hasName = props['Name']?.type === 'title';
+
+                return hasName;
+            } catch (error) {
+                return false;
+            }
+        }
+
+        // Initialize database IDs (auto-discover if missing)
+        async function initializeDatabaseIds() {
+            if (!pluginConfig.apiKey) {
+                log('No API key available for database discovery');
+                return;
+            }
+
+            let needsDiscovery = false;
+            let needsSave = false;
+            let discoveryResults = [];
+
+            // Check if Tasks Database ID is missing
+            if (!pluginConfig.tasksDatabaseId) {
+                log('Tasks Database ID not configured, will attempt auto-discovery');
+                needsDiscovery = true;
+            }
+
+            // Check if Projects Database ID is missing
+            if (!pluginConfig.projectsDatabaseId) {
+                log('Projects Database ID not configured, will attempt auto-discovery');
+                needsDiscovery = true;
+            }
+
+            if (needsDiscovery) {
+                const discoveries = await discoverDatabaseIds(pluginConfig.apiKey);
+
+                if (discoveries.tasks && !pluginConfig.tasksDatabaseId) {
+                    pluginConfig.tasksDatabaseId = discoveries.tasks;
+                    elements.tasksDatabaseId.value = discoveries.tasks;
+                    log(`✅ Auto-discovered Tasks Database ID: ${discoveries.tasks}`);
+                    discoveryResults.push('Tasks database found');
+                    needsSave = true;
+                } else if (!discoveries.tasks && !pluginConfig.tasksDatabaseId) {
+                    log('⚠️ Tasks database not found - please enter manually');
+                    discoveryResults.push('Tasks database NOT found - please enter manually');
+                }
+
+                if (discoveries.projects && !pluginConfig.projectsDatabaseId) {
+                    pluginConfig.projectsDatabaseId = discoveries.projects;
+                    elements.projectsDatabaseId.value = discoveries.projects;
+                    log(`✅ Auto-discovered Projects Database ID: ${discoveries.projects}`);
+                    discoveryResults.push('Projects database found');
+                    needsSave = true;
+                } else if (!discoveries.projects && !pluginConfig.projectsDatabaseId) {
+                    log('⚠️ Projects database not found - please enter manually');
+                    discoveryResults.push('Projects database NOT found - please enter manually');
+                }
+
+                // Update configuration to mark as configured if tasks DB is available
+                pluginConfig.configured = !!(pluginConfig.apiKey && pluginConfig.tasksDatabaseId);
+
+                if (needsSave) {
+                    // Save configuration automatically after discovery
+                    localStorage.setItem('notion-sync-config', JSON.stringify(pluginConfig));
+                    updateUI();
+                    log('Configuration auto-saved after database discovery');
+                }
+
+                // Show user feedback about discovery results
+                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                    const message = discoveryResults.join('. ');
+                    const hasSuccess = discoveryResults.some(r => r.includes('found') && !r.includes('NOT'));
+                    const hasFailure = discoveryResults.some(r => r.includes('NOT found'));
+
+                    PluginAPI.showSnack({
+                        msg: `Database discovery: ${message}`,
+                        type: hasFailure ? (hasSuccess ? 'WARNING' : 'ERROR') : 'SUCCESS'
+                    });
+                }
+
+                // Log final status for user
+                if (!pluginConfig.tasksDatabaseId) {
+                    log('❌ Tasks Database ID still missing - plugin cannot function without it');
+                }
+                if (!pluginConfig.projectsDatabaseId) {
+                    log('⚠️ Projects Database ID missing - project sync will be disabled');
+                }
+            } else {
+                log('All database IDs already configured');
+            }
+        }
+
+        // ===== END DATABASE DISCOVERY FUNCTIONS =====
+
 
         // Sync mappings stored in localStorage
         function saveSyncMappings() {
@@ -455,6 +722,19 @@
             }
 
             log('=== Starting New Sync Architecture ===');
+
+            // PHASE 0: Project/Tag Sync (must happen before task sync)
+            log('=== Phase 0: Syncing Projects and Tags ===');
+            try {
+                const projectStats = await syncProjectsWithProjects();
+                log(`Project sync: ${projectStats.created} created, ${projectStats.synced} synced`);
+
+                const tagStats = await syncTagsWithTaskTypes();
+                log(`Tag sync: ${tagStats.created} SP tags created, ${tagStats.synced} synced, ${tagStats.schemaUpdated} task type options added`);
+            } catch (error) {
+                log(`Project/Tag sync failed: ${error.message}`, 'error');
+                // Continue with task sync even if project/tag sync fails
+            }
 
             // PHASE 1: Data Collection
             const spTasks = await PluginAPI.getTasks();
@@ -619,6 +899,423 @@
             return stats;
         }
 
+        // ===== PROJECT/TAG SYNC FUNCTIONS =====
+
+        // Get all SP projects
+        async function getAllSpProjects() {
+            if (typeof PluginAPI === 'undefined') {
+                throw new Error('PluginAPI not available');
+            }
+            return await PluginAPI.getAllProjects();
+        }
+
+        // Get all SP tags
+        async function getAllSpTags() {
+            if (typeof PluginAPI === 'undefined') {
+                throw new Error('PluginAPI not available');
+            }
+            return await PluginAPI.getAllTags();
+        }
+
+        // Get all Notion projects
+        async function getAllNotionProjects() {
+            if (!pluginConfig.projectsDatabaseId) {
+                log('No Projects database ID configured, skipping projects sync');
+                return [];
+            }
+
+            const response = await fetch(`https://api.notion.com/v1/databases/${pluginConfig.projectsDatabaseId}/query`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                    'Notion-Version': '2022-06-28',
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(`Notion Projects API error: ${data.message || 'Unknown error'}`);
+            }
+
+            return data.results || [];
+        }
+
+        // Create Notion project from SP project
+        async function createNotionProjectFromSpProject(spProject) {
+            if (!pluginConfig.projectsDatabaseId) {
+                throw new Error('Projects database ID not configured');
+            }
+
+            const properties = {
+                'Name': { title: [{ text: { content: spProject.title || 'Untitled Project' } }] },
+                'Description': { rich_text: [{ text: { content: `Synced from SP Project: ${spProject.title}` } }] }
+            };
+
+            log(`   📤 Creating Notion project for SP project: ${spProject.title}`);
+            const response = await fetch('https://api.notion.com/v1/pages', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                    'Notion-Version': '2022-06-28',
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    parent: { database_id: pluginConfig.projectsDatabaseId },
+                    properties
+                })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(`Failed to create Notion project: ${errorData.message || response.statusText}`);
+            }
+
+            const result = await response.json();
+            log(`   ✅ Created Notion project: ${spProject.title} (ID: ${result.id})`);
+            return result;
+        }
+
+        // Create SP project from Notion project
+        async function createSpProjectFromNotionProject(notionProject) {
+            const projectData = {
+                title: notionProject.properties['Name']?.title?.[0]?.text?.content || 'Untitled Project'
+            };
+
+            log(`   📥 Creating SP project from Notion project: ${projectData.title}`);
+            const projectId = await PluginAPI.addProject(projectData);
+            log(`   ✅ Created SP project: ${projectData.title} (ID: ${projectId})`);
+            return { ...projectData, id: projectId };
+        }
+
+        // Sync projects with projects
+        async function syncProjectsWithProjects() {
+            if (!pluginConfig.projectsDatabaseId) {
+                log('Projects database not configured, skipping project sync');
+                return { created: 0, synced: 0 };
+            }
+
+            log('=== Syncing SP Projects ↔ Notion Projects ===');
+
+            const spProjects = await getAllSpProjects();
+            const notionProjects = await getAllNotionProjects();
+
+            log(`Found ${spProjects.length} SP projects and ${notionProjects.length} Notion projects`);
+
+            let created = 0;
+            let synced = 0;
+
+            // Create missing Notion projects for SP projects
+            for (const spProject of spProjects) {
+                const existingProject = notionProjects.find(project =>
+                    project.properties['Name']?.title?.[0]?.text?.content === spProject.title
+                );
+
+                if (!existingProject) {
+                    await createNotionProjectFromSpProject(spProject);
+                    created++;
+                } else {
+                    log(`   ⏭️ Notion project already exists for SP project: ${spProject.title}`);
+                    synced++;
+                }
+            }
+
+            // Create missing SP projects for Notion projects
+            for (const notionProject of notionProjects) {
+                const projectTitle = notionProject.properties['Name']?.title?.[0]?.text?.content;
+                if (!projectTitle) continue;
+
+                const existingProject = spProjects.find(project => project.title === projectTitle);
+
+                if (!existingProject) {
+                    await createSpProjectFromNotionProject(notionProject);
+                    created++;
+                } else {
+                    log(`   ⏭️ SP project already exists for Notion project: ${projectTitle}`);
+                    synced++;
+                }
+            }
+
+            log(`Project sync complete: ${created} created, ${synced} already synced`);
+            return { created, synced };
+        }
+
+        // Get available task types from Tasks database schema
+        async function getNotionTaskTypes() {
+            // Get the database schema to see available Task Type options
+            const response = await fetch(`https://api.notion.com/v1/databases/${pluginConfig.tasksDatabaseId}`, {
+                headers: {
+                    'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                    'Notion-Version': '2022-06-28'
+                }
+            });
+
+            const dbSchema = await response.json();
+            const taskTypeProperty = dbSchema.properties['Task Type'];
+
+            if (taskTypeProperty && taskTypeProperty.multi_select) {
+                return taskTypeProperty.multi_select.options.map(option => option.name);
+            }
+
+            return [];
+        }
+
+        // Add new option to Notion multi-select field
+        async function addTaskTypeOption(tagTitle) {
+            try {
+                // Get current database schema
+                const response = await fetch(`https://api.notion.com/v1/databases/${pluginConfig.tasksDatabaseId}`, {
+                    headers: {
+                        'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                        'Notion-Version': '2022-06-28'
+                    }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Failed to get database schema: ${response.status}`);
+                }
+
+                const database = await response.json();
+                const taskTypeProperty = database.properties['Task Type'];
+
+                if (!taskTypeProperty || taskTypeProperty.type !== 'multi_select') {
+                    throw new Error('Task Type property not found or not multi_select');
+                }
+
+                // Add new option to existing options
+                const currentOptions = taskTypeProperty.multi_select.options || [];
+
+                // Check if option already exists
+                if (currentOptions.some(option => option.name === tagTitle)) {
+                    log(`   ⏭️ Task type option already exists: ${tagTitle}`);
+                    return true;
+                }
+
+                const newOptions = [
+                    ...currentOptions,
+                    {
+                        name: tagTitle,
+                        color: 'default' // You can randomize colors if desired
+                    }
+                ];
+
+                // Update database schema
+                const updateResponse = await fetch(`https://api.notion.com/v1/databases/${pluginConfig.tasksDatabaseId}`, {
+                    method: 'PATCH',
+                    headers: {
+                        'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                        'Notion-Version': '2022-06-28',
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        properties: {
+                            'Task Type': {
+                                multi_select: {
+                                    options: newOptions
+                                }
+                            }
+                        }
+                    })
+                });
+
+                if (!updateResponse.ok) {
+                    const errorData = await updateResponse.text();
+                    throw new Error(`Failed to update database schema: ${errorData}`);
+                }
+
+                log(`   ✅ Added new Task Type option: ${tagTitle}`);
+                return true;
+
+            } catch (error) {
+                log(`   ❌ Failed to add Task Type option '${tagTitle}': ${error.message}`, 'error');
+                return false;
+            }
+        }
+
+        // Sync tags with task types
+        async function syncTagsWithTaskTypes() {
+            log('=== Syncing Tags ↔ Task Types ===');
+
+            const spTags = await getAllSpTags();
+            const availableTaskTypes = await getNotionTaskTypes();
+
+            log(`Found ${spTags.length} SP tags and ${availableTaskTypes.length} available task types`);
+
+            let created = 0;
+            let synced = 0;
+            let schemaUpdated = 0;
+
+            // Add missing task type options for SP tags
+            for (const spTag of spTags) {
+                if (availableTaskTypes.includes(spTag.title)) {
+                    log(`   ⏭️ Task type already exists for tag: ${spTag.title}`);
+                    synced++;
+                } else {
+                    log(`   🔄 Adding new Task Type option for tag: ${spTag.title}`);
+                    const success = await addTaskTypeOption(spTag.title);
+                    if (success) {
+                        schemaUpdated++;
+                    }
+                }
+            }
+
+            // Refresh available task types after schema updates
+            const updatedTaskTypes = await getNotionTaskTypes();
+
+            // Create missing SP tags for existing task types
+            for (const taskType of updatedTaskTypes) {
+                const existingTag = spTags.find(tag => tag.title === taskType);
+                if (!existingTag) {
+                    try {
+                        const tagData = { title: taskType };
+                        log(`   📥 Creating SP tag from task type: ${taskType}`);
+                        const tagId = await PluginAPI.addTag(tagData);
+                        log(`   ✅ Created SP tag: ${taskType} (ID: ${tagId})`);
+                        created++;
+                    } catch (error) {
+                        log(`   ❌ Failed to create tag ${taskType}: ${error.message}`, 'error');
+                    }
+                } else {
+                    log(`   ⏭️ Tag already exists for task type: ${taskType}`);
+                }
+            }
+
+            log(`Tag/Task Type sync complete: ${created} SP tags created, ${synced} already synced, ${schemaUpdated} new task type options added`);
+            return { created, synced, schemaUpdated };
+        }
+
+        // ===== PROJECT/TAG MAPPING HELPERS =====
+
+        // Get SP project ID from Notion projects relation
+        async function getSpProjectIdFromNotionProjects(projectsRelation) {
+            // If no project relation in Notion, map to SP "Inbox" project
+            if (!projectsRelation || !projectsRelation.length) {
+                const spProjects = await getAllSpProjects();
+                const inboxProject = spProjects.find(project => project.title === 'Inbox');
+                if (inboxProject) {
+                    log(`   📁 No Notion project relation, mapping to SP Inbox project: ${inboxProject.id}`);
+                    return inboxProject.id;
+                } else {
+                    log(`   📁 No Notion project relation and no SP Inbox project found`);
+                    return null;
+                }
+            }
+
+            try {
+                const spProjects = await getAllSpProjects();
+                const notionProjects = await getAllNotionProjects();
+
+                // Get the first project ID from the relation
+                const projectId = projectsRelation[0].id;
+                const notionProject = notionProjects.find(project => project.id === projectId);
+
+                if (notionProject) {
+                    const projectTitle = notionProject.properties['Name']?.title?.[0]?.text?.content;
+                    const spProject = spProjects.find(project => project.title === projectTitle);
+                    return spProject ? spProject.id : null;
+                }
+            } catch (error) {
+                log(`Error mapping Notion project to SP project: ${error.message}`, 'error');
+            }
+
+            return null;
+        }
+
+        // Get SP tag IDs from Notion task types
+        async function getSpTagIdsFromNotionTaskTypes(taskTypes) {
+            if (!taskTypes || !taskTypes.length) return [];
+
+            try {
+                const spTags = await getAllSpTags();
+                const tagIds = [];
+
+                for (const taskType of taskTypes) {
+                    const tagName = taskType.name;
+                    const spTag = spTags.find(tag => tag.title === tagName);
+                    if (spTag) {
+                        tagIds.push(spTag.id);
+                    }
+                }
+
+                return tagIds;
+            } catch (error) {
+                log(`Error mapping Notion task types to SP tags: ${error.message}`, 'error');
+                return [];
+            }
+        }
+
+        // Get Notion project ID from SP project
+        async function getNotionProjectIdFromSpProject(projectId) {
+            if (!projectId) {
+                log(`   📁 No project ID provided for mapping`);
+                return null;
+            }
+
+            try {
+                const spProjects = await getAllSpProjects();
+                const notionProjects = await getAllNotionProjects();
+
+                log(`   📁 Looking for SP project with ID: ${projectId}`);
+                const spProject = spProjects.find(project => project.id === projectId);
+
+                if (!spProject) {
+                    log(`   ❌ SP project not found with ID: ${projectId}`, 'error');
+                    return null;
+                }
+
+                log(`   📁 Found SP project: "${spProject.title}", searching for matching Notion project...`);
+                const notionProject = notionProjects.find(project =>
+                    project.properties['Name']?.title?.[0]?.text?.content === spProject.title
+                );
+
+                if (notionProject) {
+                    log(`   ✅ Found matching Notion project: "${spProject.title}" → ${notionProject.id}`);
+
+                    // Validate the project ID format
+                    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+                    if (!uuidRegex.test(notionProject.id)) {
+                        log(`   ❌ Invalid project ID format: ${notionProject.id}`, 'error');
+                        return null;
+                    }
+
+                    return notionProject.id;
+                } else {
+                    log(`   ❌ No matching Notion project found for project: "${spProject.title}"`, 'error');
+                    log(`   Available projects: ${notionProjects.map(p => p.properties['Name']?.title?.[0]?.text?.content || 'Untitled').join(', ')}`);
+                    return null;
+                }
+            } catch (error) {
+                log(`Error mapping SP project to Notion project: ${error.message}`, 'error');
+                return null;
+            }
+        }
+
+        // Get Notion task types from SP tag IDs
+        async function getNotionTaskTypesFromSpTags(tagIds) {
+            if (!tagIds || !tagIds.length) return [];
+
+            try {
+                const spTags = await getAllSpTags();
+                const availableTaskTypes = await getNotionTaskTypes();
+                const taskTypes = [];
+
+                for (const tagId of tagIds) {
+                    const spTag = spTags.find(tag => tag.id === tagId);
+                    if (spTag && availableTaskTypes.includes(spTag.title)) {
+                        taskTypes.push({ name: spTag.title });
+                    }
+                }
+
+                return taskTypes;
+            } catch (error) {
+                log(`Error mapping SP tags to Notion task types: ${error.message}`, 'error');
+                return [];
+            }
+        }
+
+        // ===== END PROJECT/TAG SYNC FUNCTIONS =====
+
         // Get all Notion tasks (filter out archived tasks at API level)
         async function getAllNotionTasks() {
             const response = await fetch(`https://api.notion.com/v1/databases/${pluginConfig.tasksDatabaseId}/query`, {
@@ -654,14 +1351,25 @@
 
         // Create SP task from Notion page
         async function createSpTaskFromNotion(notionPage) {
+            // Map project from Notion Projects relation
+            const projectsRelation = notionPage.properties['Projects']?.relation;
+            const projectId = await getSpProjectIdFromNotionProjects(projectsRelation);
+
+            // Map tags from Notion Task Type multi-select
+            const taskTypes = notionPage.properties['Task Type']?.multi_select;
+            const tagIds = await getSpTagIdsFromNotionTaskTypes(taskTypes);
+
+            log(`   🏷️ Mapped ${tagIds.length} tags from task types: ${taskTypes?.map(t => t.name).join(', ') || 'none'}`);
+            log(`   📁 Mapped project ID: ${projectId || 'none'}`);
+
             // Create basic task data (only fields supported by PluginCreateTaskData)
             const taskData = {
                 title: notionPage.properties['Name']?.title?.[0]?.text?.content || 'Untitled',
                 notes: notionPage.properties['Notes']?.rich_text?.[0]?.text?.content || '',
                 isDone: getCompletionStatusFromNotion(notionPage),
                 timeEstimate: (notionPage.properties['Time Estimate']?.number || 0) * 3600000, // hours to ms
-                projectId: null,
-                tagIds: [],
+                projectId: projectId || undefined, // Use undefined for tasks without a project
+                tagIds: tagIds,
                 parentId: null
             };
 
@@ -750,6 +1458,26 @@
 
             if (spTask.timeSpent) {
                 properties['Time Spent'] = { number: Math.round(spTask.timeSpent / 3600000 * 100) / 100 };
+            }
+
+            // Map project to Notion Projects relation
+            if (spTask.projectId && spTask.projectId !== 'Inbox') {
+                const projectId = await getNotionProjectIdFromSpProject(spTask.projectId);
+                if (projectId) {
+                    properties['Projects'] = { relation: [{ id: projectId }] };
+                    log(`   📁 Mapped SP project to Notion project: ${projectId}`);
+                }
+            } else if (spTask.projectId === 'Inbox') {
+                log(`   📁 Task is in Inbox, not setting any project relation in Notion`);
+            }
+
+            // Map tags to Notion Task Type multi-select
+            if (spTask.tagIds && spTask.tagIds.length > 0) {
+                const taskTypes = await getNotionTaskTypesFromSpTags(spTask.tagIds);
+                if (taskTypes.length > 0) {
+                    properties['Task Type'] = { multi_select: taskTypes };
+                    log(`   🏷️ Mapped ${taskTypes.length} SP tags to task types: ${taskTypes.map(t => t.name).join(', ')}`);
+                }
             }
 
             // Handle scheduling using new system
@@ -849,6 +1577,22 @@
                 log(`   ⚠️ Notion shows "Not started" but SP has time spent (${(spTask.timeSpent / 3600000).toFixed(2)}h). Will update Notion to "In progress" on next sync.`);
             }
 
+            // Handle project mapping: Notion Projects → SP Project
+            const projectsRelation = notionPage.properties['Projects']?.relation;
+            const mappedProjectId = await getSpProjectIdFromNotionProjects(projectsRelation);
+            if (spTask.projectId !== mappedProjectId) {
+                updates.projectId = mappedProjectId || 'Inbox'; // Use 'Inbox' for tasks without a project
+                log(`   📁 Project updated: ${spTask.projectId} → ${mappedProjectId || 'Inbox'}`);
+            }
+
+            // Handle tag mapping: Notion Task Type → SP Tags
+            const taskTypes = notionPage.properties['Task Type']?.multi_select;
+            const mappedTagIds = await getSpTagIdsFromNotionTaskTypes(taskTypes);
+            if (JSON.stringify(spTask.tagIds || []) !== JSON.stringify(mappedTagIds)) {
+                updates.tagIds = mappedTagIds;
+                log(`   🏷️ Tags updated: [${(spTask.tagIds || []).join(', ')}] → [${mappedTagIds.join(', ')}]`);
+            }
+
             // Apply updates if any
             if (Object.keys(updates).length > 0) {
                 await updateSpTask(spTask.id, updates);
@@ -899,6 +1643,39 @@
 
             if (!schedulingEquals(currentScheduling, newScheduling)) {
                 properties['Scheduling'] = { date: newScheduling };
+            }
+
+            // Handle project mapping: SP Project → Notion Projects
+            const currentProjects = notionPage.properties['Projects']?.relation || [];
+            let expectedProjectId = null;
+
+            if (spTask.projectId && spTask.projectId !== 'Inbox') {
+                expectedProjectId = await getNotionProjectIdFromSpProject(spTask.projectId);
+            }
+
+            const currentProjectIds = currentProjects.map(p => p.id);
+            const expectedProjectIds = expectedProjectId ? [expectedProjectId] : [];
+
+            if (JSON.stringify(currentProjectIds.sort()) !== JSON.stringify(expectedProjectIds.sort())) {
+                if (expectedProjectIds.length > 0) {
+                    properties['Projects'] = { relation: [{ id: expectedProjectId }] };
+                    log(`   📁 Projects updated: [${currentProjectIds.join(', ')}] → [${expectedProjectIds.join(', ')}]`);
+                } else {
+                    properties['Projects'] = { relation: [] };
+                    log(`   📁 Projects cleared: [${currentProjectIds.join(', ')}] → [] (task moved to Inbox)`);
+                }
+            }
+
+            // Handle tag mapping: SP Tags → Notion Task Type
+            const currentTaskTypes = notionPage.properties['Task Type']?.multi_select || [];
+            const expectedTaskTypes = await getNotionTaskTypesFromSpTags(spTask.tagIds || []);
+
+            const currentTypeNames = currentTaskTypes.map(t => t.name).sort();
+            const expectedTypeNames = expectedTaskTypes.map(t => t.name).sort();
+
+            if (JSON.stringify(currentTypeNames) !== JSON.stringify(expectedTypeNames)) {
+                properties['Task Type'] = { multi_select: expectedTaskTypes };
+                log(`   🏷️ Task types updated: [${currentTypeNames.join(', ')}] → [${expectedTypeNames.join(', ')}]`);
             }
 
             // Apply updates if any
@@ -1155,6 +1932,8 @@
 
 
         async function createNotionTask(properties) {
+            log(`   📤 Creating Notion task with properties: ${JSON.stringify(properties, null, 2)}`);
+
             const response = await fetch('https://api.notion.com/v1/pages', {
                 method: 'POST',
                 headers: {
@@ -1169,7 +1948,9 @@
             });
 
             if (!response.ok) {
-                throw new Error(`Failed to create Notion task: ${response.statusText}`);
+                const errorData = await response.text();
+                log(`   ❌ Notion API error response: ${errorData}`, 'error');
+                throw new Error(`Failed to create Notion task (${response.status}): ${errorData}`);
             }
 
             return await response.json();
@@ -1342,9 +2123,10 @@
 
                 const importConfig = importData.configuration;
 
-                // Import both API key and database ID
+                // Import all configuration fields
                 elements.apiKey.value = importConfig.apiKey || '';
                 elements.tasksDatabaseId.value = importConfig.tasksDatabaseId || '';
+                elements.projectsDatabaseId.value = importConfig.projectsDatabaseId || '';
 
                 log(`Configuration imported from ${file.name}`);
                 log('Please verify the configuration and save if needed');
@@ -1378,6 +2160,7 @@
 
         // Event listeners
         elements.saveConfigBtn.addEventListener('click', saveConfiguration);
+        elements.discoverDbBtn.addEventListener('click', discoverDatabases);
         elements.testConnectionBtn.addEventListener('click', testConnection);
         elements.manualSyncBtn.addEventListener('click', performManualSync);
         elements.exportConfigBtn.addEventListener('click', exportConfiguration);
@@ -1388,6 +2171,11 @@
         async function initialize() {
             log('Notion Sync Plugin UI initialized');
             loadConfiguration();
+
+            // Try to auto-discover missing database IDs if API key is available
+            if (pluginConfig.apiKey) {
+                await initializeDatabaseIds();
+            }
 
             // Auto-connect if configuration exists
             if (pluginConfig.apiKey && pluginConfig.tasksDatabaseId) {
