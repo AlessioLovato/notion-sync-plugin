@@ -86,6 +86,25 @@
             box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
         }
 
+        /* Log toggle styling */
+        .log-toggle {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+        }
+        .log-toggle-label {
+            font-weight: 500;
+            color: #374151;
+            flex: 1;
+        }
+        .log-toggle-checkbox {
+            width: auto !important;
+            margin-left: 12px;
+            transform: scale(1.2);
+            cursor: pointer;
+        }
+
         .button {
             background: #6366f1;
             color: white;
@@ -183,8 +202,16 @@
             <input type="file" id="importConfigFile" accept=".json" class="hidden">
         </div>
 
-        <!-- Log -->
+        <!-- Log Controls -->
         <div class="card">
+            <div class="form-group log-toggle">
+                <span class="log-toggle-label">Enable Logging</span>
+                <input type="checkbox" id="enableLogging" class="log-toggle-checkbox" checked>
+            </div>
+        </div>
+
+        <!-- Log -->
+        <div class="card" id="logCard">
             <h3>Log</h3>
             <div id="syncLog" class="log-container">Plugin initialized.\n</div>
             <button id="clearLogBtn" class="button button-secondary">Clear Log</button>
@@ -197,7 +224,8 @@
             apiKey: '',
             tasksDatabaseId: '',
             projectsDatabaseId: '',
-            configured: false
+            configured: false,
+            enableLogging: true
         };
 
         // UI Elements
@@ -213,12 +241,16 @@
             exportConfigBtn: document.getElementById('exportConfigBtn'),
             importConfigBtn: document.getElementById('importConfigBtn'),
             importConfigFile: document.getElementById('importConfigFile'),
+            enableLogging: document.getElementById('enableLogging'),
+            logCard: document.getElementById('logCard'),
             syncLog: document.getElementById('syncLog'),
             clearLogBtn: document.getElementById('clearLogBtn')
         };
 
         // Logging function
         function log(message, type = 'info') {
+            if (!pluginConfig.enableLogging) return; // Skip logging if disabled
+
             const timestamp = new Date().toLocaleTimeString();
             const logEntry = `[${timestamp}] ${type.toUpperCase()}: ${message}\n`;
             elements.syncLog.textContent += logEntry;
@@ -243,6 +275,10 @@
             elements.apiKey.value = pluginConfig.apiKey || '';
             elements.tasksDatabaseId.value = pluginConfig.tasksDatabaseId || '';
             elements.projectsDatabaseId.value = pluginConfig.projectsDatabaseId || '';
+            elements.enableLogging.checked = pluginConfig.enableLogging;
+
+            // Show/hide log card based on logging setting
+            elements.logCard.style.display = pluginConfig.enableLogging ? 'block' : 'none';
 
             // Enable/disable buttons
             elements.discoverDbBtn.disabled = !pluginConfig.apiKey;
@@ -288,6 +324,7 @@
                 const apiKey = elements.apiKey.value.trim();
                 const tasksDatabaseId = elements.tasksDatabaseId.value.trim();
                 const projectsDatabaseId = elements.projectsDatabaseId.value.trim();
+                const enableLogging = elements.enableLogging.checked;
 
                 if (!apiKey) {
                     throw new Error('API Key is required');
@@ -312,6 +349,7 @@
                     apiKey: apiKey,
                     tasksDatabaseId: tasksDatabaseId || '',
                     projectsDatabaseId: projectsDatabaseId || '',
+                    enableLogging: enableLogging,
                     configured: !!(apiKey && tasksDatabaseId) // Only configured if both API key and tasks DB are present
                 };
 
@@ -338,6 +376,20 @@
                     });
                 }
             }
+        }
+
+        // Toggle logging function
+        function toggleLogging() {
+            pluginConfig.enableLogging = elements.enableLogging.checked;
+
+            // Update UI immediately
+            elements.logCard.style.display = pluginConfig.enableLogging ? 'block' : 'none';
+
+            // Save configuration
+            localStorage.setItem('notion-sync-config', JSON.stringify(pluginConfig));
+
+            // Log the change (will only show if logging is enabled)
+            log(`Logging ${pluginConfig.enableLogging ? 'enabled' : 'disabled'}`);
         }
 
         // Core connection test function (returns boolean)
@@ -2165,6 +2217,7 @@
         elements.manualSyncBtn.addEventListener('click', performManualSync);
         elements.exportConfigBtn.addEventListener('click', exportConfiguration);
         elements.importConfigBtn.addEventListener('click', importConfiguration);
+        elements.enableLogging.addEventListener('change', toggleLogging);
         elements.clearLogBtn.addEventListener('click', clearLog);
 
         // Initialize
