@@ -415,106 +415,6 @@
             }
         }
 
-        // Manual sync between SP and Notion (task names only)
-        // Helper functions from plugin.js for property conversion
-        function spTaskToNotionProperties(task) {
-            const properties = {
-                'Name': {
-                    title: [{ text: { content: task.title || 'Untitled Task' } }]
-                },
-                'SP Task ID': {
-                    rich_text: [{ text: { content: task.id } }]
-                },
-                'Complete': {
-                    checkbox: task.isDone || false
-                }
-            };
-
-            // Add notes if present
-            if (task.notes) {
-                properties['Notes'] = {
-                    rich_text: [{ text: { content: task.notes } }]
-                };
-            }
-
-            // Add time estimate (convert from milliseconds to hours)
-            if (task.timeEstimate) {
-                properties['Time Estimate'] = {
-                    number: Math.round(task.timeEstimate / 3600000 * 100) / 100
-                };
-            }
-
-            // Add time spent (convert from milliseconds to hours)
-            if (task.timeSpent) {
-                properties['Time Spent'] = {
-                    number: Math.round(task.timeSpent / 3600000 * 100) / 100
-                };
-            }
-
-            // Add priority
-            if (task.priority) {
-                const priorityMap = {
-                    'URGENT': 'Urgent',
-                    'HIGH': 'High',
-                    'MEDIUM': 'Medium',
-                    'LOW': 'Low'
-                };
-                properties['Priority'] = {
-                    select: { name: priorityMap[task.priority] || 'Medium' }
-                };
-            }
-
-            // Add scheduling date
-            if (task.plannedAt || task.remindAt) {
-                const date = new Date(task.plannedAt || task.remindAt);
-                properties['Scheduling'] = {
-                    date: { start: date.toISOString().split('T')[0] }
-                };
-            }
-
-            return properties;
-        }
-
-        function notionPageToSpTask(page) {
-            const props = page.properties;
-
-            const task = {
-                title: props.Name?.title?.[0]?.text?.content || 'Untitled',
-                notes: props.Notes?.rich_text?.[0]?.text?.content || '',
-                isDone: props.Complete?.checkbox || false,
-                createdAt: new Date(page.created_time).getTime(),
-                id: props['SP Task ID']?.rich_text?.[0]?.text?.content || null
-            };
-
-            // Convert time estimate (hours to milliseconds)
-            if (props['Time Estimate']?.number) {
-                task.timeEstimate = props['Time Estimate'].number * 3600000;
-            }
-
-            // Convert time spent (hours to milliseconds)
-            if (props['Time Spent']?.number) {
-                task.timeSpent = props['Time Spent'].number * 3600000;
-            }
-
-            // Convert priority
-            if (props.Priority?.select?.name) {
-                const priorityMap = {
-                    'Urgent': 'URGENT',
-                    'High': 'HIGH',
-                    'Medium': 'MEDIUM',
-                    'Low': 'LOW'
-                };
-                task.priority = priorityMap[props.Priority.select.name] || 'MEDIUM';
-            }
-
-            // Convert scheduling date
-            if (props.Scheduling?.date?.start) {
-                const scheduledDate = new Date(props.Scheduling.date.start);
-                task.plannedAt = scheduledDate.getTime();
-            }
-
-            return task;
-        }
 
         // Sync mappings stored in localStorage
         function saveSyncMappings() {
@@ -591,19 +491,23 @@
             // 2A: Create SP tasks for Notion pages without valid SP Task ID
             for (const notionPage of notionTasks) {
                 const spTaskId = notionPage.properties['SP Task ID']?.rich_text?.[0]?.text?.content;
+                const notionTitle = notionPage.properties['Name']?.title?.[0]?.text?.content || 'Untitled';
+
+                log(`🔍 Processing Notion task: "${notionTitle}" (SP ID: ${spTaskId})`);
 
                 if (!spTaskId || !spTasksById.has(spTaskId)) {
                     // Check if we should create this task (avoid duplicates by title)
-                    const notionTitle = notionPage.properties['Name']?.title?.[0]?.text?.content || 'Untitled';
                     const existingActiveTask = spTasks.find(t => t.title === notionTitle);
                     const existingArchivedTask = archivedTasks.find(t => t.title === notionTitle);
+
+                    log(`   📋 Duplicate check: Active=${!!existingActiveTask}, Archived=${!!existingArchivedTask}`);
 
                     if (existingActiveTask) {
                         // Link existing active SP task to Notion page
                         await updateNotionTask(notionPage.id, {
                             'SP Task ID': { rich_text: [{ text: { content: existingActiveTask.id } }] }
                         });
-                        log(`Linked existing active SP task: ${existingActiveTask.title}`);
+                        log(`   🔗 Linked existing active SP task: ${existingActiveTask.title}`);
                     } else if (existingArchivedTask) {
                         // Restore archived task: create new active task based on archived one
                         const restoredTaskData = {
@@ -612,9 +516,11 @@
                             isDone: false, // Restore as active task
                             timeEstimate: existingArchivedTask.timeEstimate || 0,
                             timeSpent: existingArchivedTask.timeSpent || 0,
-                            plannedAt: existingArchivedTask.plannedAt
+                            dueWithTime: existingArchivedTask.dueWithTime,
+                            dueDay: existingArchivedTask.dueDay
                         };
 
+                        log(`   📥 Restoring archived task: ${existingArchivedTask.title}`);
                         const newTaskId = await PluginAPI.addTask(restoredTaskData);
 
                         // Link new task to Notion page
@@ -623,22 +529,36 @@
                         });
 
                         stats.notionToSpCreates++;
-                        log(`Restored SP task from archive: ${existingArchivedTask.title}`);
+                        log(`   ✅ Restored SP task from archive: ${existingArchivedTask.title} (ID: ${newTaskId})`);
+
+                        // Update lookup map to prevent duplicate creation in Phase 2B
+                        notionTasksBySPId.set(newTaskId, notionPage);
                     } else {
                         // Create completely new task
+                        log(`   ➕ Creating new SP task: ${notionTitle}`);
                         const newSpTask = await createSpTaskFromNotion(notionPage);
                         stats.notionToSpCreates++;
-                        log(`Created SP task: ${newSpTask.title}`);
+                        log(`   ✅ Created SP task: ${newSpTask.title} (ID: ${newSpTask.id})`);
+
+                        // Update lookup map to prevent duplicate creation in Phase 2B
+                        notionTasksBySPId.set(newSpTask.id, notionPage);
                     }
+                } else {
+                    log(`   ⏭️ Skipping: Already has valid SP Task ID`);
                 }
             }
 
             // 2B: Create Notion tasks for SP tasks not in Notion (only active tasks)
+            log('=== Phase 2B: Creating Notion tasks for SP tasks ===');
             for (const spTask of spTasks) { // Only active tasks
+                log(`🔍 Processing SP task: "${spTask.title}" (ID: ${spTask.id})`);
                 if (!notionTasksBySPId.has(spTask.id)) {
+                    log(`   ➕ Creating Notion task for SP task: ${spTask.title}`);
                     await createNotionTaskFromSp(spTask);
                     stats.spToNotionCreates++;
-                    log(`Created Notion task: ${spTask.title}`);
+                    log(`   ✅ Created Notion task: ${spTask.title}`);
+                } else {
+                    log(`   ⏭️ Skipping: SP task already has Notion page`);
                 }
             }
 
@@ -734,37 +654,78 @@
 
         // Create SP task from Notion page
         async function createSpTaskFromNotion(notionPage) {
+            // Create basic task data (only fields supported by PluginCreateTaskData)
             const taskData = {
                 title: notionPage.properties['Name']?.title?.[0]?.text?.content || 'Untitled',
                 notes: notionPage.properties['Notes']?.rich_text?.[0]?.text?.content || '',
                 isDone: getCompletionStatusFromNotion(notionPage),
                 timeEstimate: (notionPage.properties['Time Estimate']?.number || 0) * 3600000, // hours to ms
-                timeSpent: (notionPage.properties['Time Spent']?.number || 0) * 3600000
+                projectId: null,
+                tagIds: [],
+                parentId: null
             };
 
-            // Handle enhanced scheduling (plannedAt and timeEstimate)
+            log(`   📊 Creating SP task with basic data: ${JSON.stringify(taskData, null, 2)}`);
+            const newTaskId = await PluginAPI.addTask(taskData);
+            log(`   ✅ Successfully created SP task with ID: ${newTaskId}`);
+
+            // Now handle scheduling via updateTask (since PluginCreateTaskData doesn't support dueDay/dueWithTime)
             const schedulingData = notionPage.properties['Scheduling']?.date;
             if (schedulingData?.start) {
-                taskData.plannedAt = new Date(schedulingData.start).getTime();
+                const start = schedulingData.start;
+                const end = schedulingData.end;
+                const schedulingUpdates = {};
 
-                // If Notion has end time, calculate timeEstimate
-                if (schedulingData.end) {
-                    const startTime = new Date(schedulingData.start).getTime();
-                    const endTime = new Date(schedulingData.end).getTime();
-                    const calculatedTimeEstimate = endTime - startTime;
+                log(`   📅 Processing scheduling data: ${JSON.stringify(schedulingData)}`);
 
-                    if (calculatedTimeEstimate > 0) {
-                        taskData.timeEstimate = calculatedTimeEstimate;
+                // Use the same conversion logic as the update function
+                if (!start.includes('T') && !end) {
+                    // Case 1a: Date-only without end
+                    schedulingUpdates.dueDay = start;
+                    log(`   📅 Setting dueDay: ${start}`);
+                } else if (!start.includes('T') && end && !end.includes('T')) {
+                    // Case 1b: Date-only range (start to end)
+                    schedulingUpdates.dueDay = start;
+                    // Calculate duration in days and convert to milliseconds
+                    const startDate = new Date(start);
+                    const endDate = new Date(end);
+                    const daysDuration = (endDate - startDate) / (1000 * 60 * 60 * 24);
+                    if (daysDuration > 0) {
+                        schedulingUpdates.timeEstimate = daysDuration * 24 * 3600000; // Convert to milliseconds
+                        log(`   ⏱️ Setting duration: ${daysDuration} days`);
                     }
+                    log(`   📅 Setting dueDay: ${start} (range end: ${end})`);
+                } else if (start.includes('T')) {
+                    // Case 2&3: DateTime - set both dueWithTime AND dueDay
+                    schedulingUpdates.dueWithTime = new Date(start).getTime();
+                    schedulingUpdates.dueDay = start.split('T')[0]; // Extract date part
+
+                    log(`   📅 Setting dueWithTime: ${schedulingUpdates.dueWithTime} (${new Date(start).toLocaleString()})`);
+                    log(`   📅 Setting dueDay: ${schedulingUpdates.dueDay}`);
+
+                    // If has end time, calculate timeEstimate (only if not already set from Time Estimate field)
+                    if (end && end.includes('T')) {
+                        const duration = new Date(end).getTime() - new Date(start).getTime();
+                        if (duration > 0 && taskData.timeEstimate === 0) {
+                            schedulingUpdates.timeEstimate = duration;
+                            log(`   ⏱️ Setting timeEstimate from duration: ${(duration / 3600000).toFixed(2)}h`);
+                        }
+                    }
+                }
+
+                // Apply scheduling updates
+                if (Object.keys(schedulingUpdates).length > 0) {
+                    await updateSpTask(newTaskId, schedulingUpdates);
+                    log(`   ✅ Applied scheduling updates: ${Object.keys(schedulingUpdates).join(', ')}`);
                 }
             }
 
-            const newTaskId = await PluginAPI.addTask(taskData);
-
             // Update Notion page with SP Task ID
+            log(`   🔄 Updating Notion page with SP Task ID: ${newTaskId}`);
             await updateNotionTask(notionPage.id, {
                 'SP Task ID': { rich_text: [{ text: { content: newTaskId } }] }
             });
+            log(`   ✅ Successfully linked Notion page to SP task`);
 
             return { ...taskData, id: newTaskId };
         }
@@ -791,17 +752,9 @@
                 properties['Time Spent'] = { number: Math.round(spTask.timeSpent / 3600000 * 100) / 100 };
             }
 
-            if (spTask.plannedAt) {
-                let schedulingData = {
-                    start: new Date(spTask.plannedAt).toISOString()
-                };
-
-                // If SP has time estimate, add end time for full date range
-                if (spTask.timeEstimate && spTask.timeEstimate > 0) {
-                    const endTime = new Date(spTask.plannedAt + spTask.timeEstimate);
-                    schedulingData.end = endTime.toISOString();
-                }
-
+            // Handle scheduling using new system
+            const schedulingData = convertSpSchedulingToNotion(spTask);
+            if (schedulingData) {
                 properties['Scheduling'] = { date: schedulingData };
             }
 
@@ -877,6 +830,19 @@
                 }
             }
 
+            // Handle scheduling sync: Notion → SP
+            const notionScheduling = notionPage.properties['Scheduling']?.date;
+            if (notionScheduling) {
+                const schedulingUpdates = convertNotionSchedulingToSp(notionScheduling, spTask);
+                Object.assign(updates, schedulingUpdates);
+            } else {
+                // Clear SP scheduling if Notion has no scheduling
+                if (spTask.dueWithTime || spTask.dueDay) {
+                    updates.dueWithTime = undefined;
+                    updates.dueDay = undefined;
+                }
+            }
+
             // Special case: If Notion shows "Not started" but SP has time spent > 0,
             // we should update Notion status to "In progress" on the next SP→Notion sync
             if (notionStatus === 'Not started' && (spTask.timeSpent || 0) > 0) {
@@ -927,6 +893,14 @@
                 properties['Status'] = { status: { name: expectedStatus } };
             }
 
+            // Handle scheduling sync: SP → Notion
+            const currentScheduling = notionPage.properties['Scheduling']?.date;
+            const newScheduling = convertSpSchedulingToNotion(spTask);
+
+            if (!schedulingEquals(currentScheduling, newScheduling)) {
+                properties['Scheduling'] = { date: newScheduling };
+            }
+
             // Apply updates if any
             if (Object.keys(properties).length > 0) {
                 await updateNotionTask(notionPage.id, properties);
@@ -937,107 +911,224 @@
             return false;
         }
 
-        // Enhanced scheduling sync with start/end times and time estimates
-        async function syncSchedulingField(spTask, notionPage) {
-            const notionScheduling = notionPage.properties['Scheduling']?.date;
-            let spUpdated = false;
-            let notionUpdated = false;
+        // Convert Notion scheduling to SP format (only return differences)
+        function convertNotionSchedulingToSp(notionScheduling, spTask) {
+            const updates = {};
 
-            // SP → Notion: Create date range if SP has plannedAt and timeEstimate
-            if (spTask.plannedAt) {
-                const startTime = new Date(spTask.plannedAt);
-
-                // Determine if we should include time or use date-only
-                const hasTimeEstimate = spTask.timeEstimate && spTask.timeEstimate > 0;
-
-                let schedulingData;
-
-                if (hasTimeEstimate) {
-                    // Has time estimate - include time
-                    const endTime = new Date(spTask.plannedAt + spTask.timeEstimate);
-                    schedulingData = {
-                        start: startTime.toISOString(),
-                        end: endTime.toISOString(),
-                        time_zone: null // Let Notion handle timezone
-                    };
-                } else {
-                    // No time estimate - date only (fixes 2am issue)
-                    schedulingData = {
-                        start: startTime.toISOString().split('T')[0], // Date only (YYYY-MM-DD)
-                        time_zone: null
-                    };
-                }
-
-                // Check if Notion scheduling needs update
-                const currentStart = notionScheduling?.start;
-                const currentEnd = notionScheduling?.end;
-
-                // Compare dates properly: normalize both to same format for comparison
-                let needsUpdate = false;
-
-                if (hasTimeEstimate) {
-                    // Comparing full datetime format
-                    const normalizedCurrentStart = currentStart ? new Date(currentStart).toISOString() : null;
-                    const normalizedNewStart = schedulingData.start;
-                    const normalizedCurrentEnd = currentEnd ? new Date(currentEnd).toISOString() : null;
-                    const normalizedNewEnd = schedulingData.end;
-
-                    needsUpdate = normalizedCurrentStart !== normalizedNewStart ||
-                                  normalizedCurrentEnd !== normalizedNewEnd;
-                } else {
-                    // Comparing date-only format (YYYY-MM-DD)
-                    const currentDateOnly = currentStart ? currentStart.split('T')[0] : null;
-                    const newDateOnly = schedulingData.start; // Already in YYYY-MM-DD format
-
-                    needsUpdate = currentDateOnly !== newDateOnly || currentEnd !== null;
-                }
-
-                if (needsUpdate) {
-                    await updateNotionTask(notionPage.id, {
-                        'Scheduling': { date: schedulingData }
-                    });
-                    notionUpdated = true;
-                    log(`Updated Notion scheduling: ${spTask.title} (${schedulingData.start}${schedulingData.end ? ' → ' + schedulingData.end : ''}) hasTime: ${hasTimeEstimate}`);
-                }
-            } else if (notionScheduling?.start) {
-                // Clear Notion scheduling if SP has no plannedAt
-                await updateNotionTask(notionPage.id, {
-                    'Scheduling': { date: null }
-                });
-                notionUpdated = true;
-                log(`Cleared Notion scheduling: ${spTask.title}`);
+            if (!notionScheduling || !notionScheduling.start) {
+                return updates;
             }
 
-            // Notion → SP: Extract plannedAt and timeEstimate from Notion scheduling
-            if (notionScheduling?.start) {
-                const notionStart = new Date(notionScheduling.start).getTime();
-                let updates = {};
+            const start = notionScheduling.start;
+            const end = notionScheduling.end;
 
-                // Update plannedAt if different
-                if (spTask.plannedAt !== notionStart) {
-                    updates.plannedAt = notionStart;
+            // Case 1a: Date-only start without end (e.g., "2025-09-27")
+            if (!start.includes('T') && !end) {
+                if (spTask.dueDay !== start) {
+                    updates.dueDay = start;
+                }
+                if (spTask.dueWithTime !== undefined) {
+                    updates.dueWithTime = undefined;
+                }
+                // Clear timeEstimate since there's no duration
+                if (spTask.timeEstimate > 0) {
+                    updates.timeEstimate = 0;
+                    log(`   ⏱️ Clearing timeEstimate (date-only, no end)`);
+                }
+                if (Object.keys(updates).length > 0) {
+                    log(`   📅 Date-only scheduling: ${start}`);
+                }
+            }
+            // Case 1b: Date-only start with date-only end (e.g., "2025-09-27" to "2025-09-29")
+            else if (!start.includes('T') && end && !end.includes('T')) {
+                // For date ranges, use the start date as dueDay
+                if (spTask.dueDay !== start) {
+                    updates.dueDay = start;
+                }
+                if (spTask.dueWithTime !== undefined) {
+                    updates.dueWithTime = undefined;
+                }
+                // Calculate duration in days and convert to hours for timeEstimate
+                const startDate = new Date(start);
+                const endDate = new Date(end);
+                const daysDuration = (endDate - startDate) / (1000 * 60 * 60 * 24);
+                const hoursDuration = daysDuration * 24 * 3600000; // Convert to milliseconds
+
+                if (daysDuration > 0 && spTask.timeEstimate !== hoursDuration) {
+                    updates.timeEstimate = hoursDuration;
                 }
 
-                // Calculate and update timeEstimate if Notion has end time
-                if (notionScheduling.end) {
-                    const notionEnd = new Date(notionScheduling.end).getTime();
-                    const calculatedTimeEstimate = notionEnd - notionStart;
+                if (Object.keys(updates).length > 0) {
+                    log(`   📅 Date range scheduling: ${start} → ${end} (${daysDuration} days)`);
+                }
+            }
+            // Case 2: DateTime without end (e.g., "2025-09-27T01:00:00.000+02:00")
+            else if (start.includes('T') && !end) {
+                const startTime = new Date(start).getTime();
+                const dateOnly = start.split('T')[0]; // Extract date part
 
-                    if (calculatedTimeEstimate > 0 && spTask.timeEstimate !== calculatedTimeEstimate) {
-                        updates.timeEstimate = calculatedTimeEstimate;
+                if (spTask.dueWithTime !== startTime) {
+                    updates.dueWithTime = startTime;
+                }
+                // Also set dueDay to the date part
+                if (spTask.dueDay !== dateOnly) {
+                    updates.dueDay = dateOnly;
+                }
+                // Clear timeEstimate if SP had one (since Notion no longer has duration)
+                if (spTask.timeEstimate > 0) {
+                    updates.timeEstimate = 0;
+                    log(`   ⏱️ Clearing timeEstimate (no end time in Notion)`);
+                }
+                if (Object.keys(updates).length > 0) {
+                    log(`   🕐 DateTime scheduling: ${start} → ${startTime} (dueDay: ${dateOnly})`);
+                }
+            }
+            // Case 3: DateTime with start+end (calculate duration)
+            else if (start.includes('T') && end) {
+                const startTime = new Date(start).getTime();
+                const endTime = new Date(end).getTime();
+                const duration = endTime - startTime;
+                const dateOnly = start.split('T')[0]; // Extract date part
+
+                if (spTask.dueWithTime !== startTime) {
+                    updates.dueWithTime = startTime;
+                }
+                // Also set dueDay to the date part
+                if (spTask.dueDay !== dateOnly) {
+                    updates.dueDay = dateOnly;
+                }
+                if (duration > 0 && spTask.timeEstimate !== duration) {
+                    updates.timeEstimate = duration;
+                }
+
+                if (Object.keys(updates).length > 0) {
+                    if (duration > 0) {
+                        log(`   ⏱️ DateTime with duration: ${start} → ${end} (${(duration / 3600000).toFixed(2)}h, dueDay: ${dateOnly})`);
+                    } else {
+                        log(`   🕐 DateTime scheduling: ${start} (dueDay: ${dateOnly})`);
                     }
                 }
-
-                // Apply updates if any
-                if (Object.keys(updates).length > 0) {
-                    await updateSpTask(spTask.id, updates);
-                    spUpdated = true;
-                    log(`Updated SP scheduling: ${spTask.title} (${Object.keys(updates).join(', ')})`);
-                }
             }
 
-            return { spUpdated, notionUpdated };
+            return updates;
         }
+
+        // Helper function to format date with timezone offset
+        function formatDateWithTimezone(date) {
+            const offset = -date.getTimezoneOffset();
+            const sign = offset >= 0 ? '+' : '-';
+            const hours = Math.floor(Math.abs(offset) / 60).toString().padStart(2, '0');
+            const minutes = (Math.abs(offset) % 60).toString().padStart(2, '0');
+
+            // Get ISO string and replace Z with timezone offset
+            return date.toISOString().replace('Z', `${sign}${hours}:${minutes}`);
+        }
+
+        // Convert SP scheduling to Notion format
+        function convertSpSchedulingToNotion(spTask) {
+            // Get system timezone
+            const systemTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+            // Case 1a: SP has dueDay (date-only) without timeEstimate
+            if (spTask.dueDay && !spTask.dueWithTime && (!spTask.timeEstimate || spTask.timeEstimate <= 0)) {
+                return {
+                    start: spTask.dueDay, // "2025-09-27"
+                    end: null,
+                    time_zone: null // No timezone for date-only entries
+                };
+            }
+            // Case 1b: SP has dueDay (date-only) with timeEstimate (duration)
+            else if (spTask.dueDay && !spTask.dueWithTime && spTask.timeEstimate > 0) {
+                const startDate = new Date(spTask.dueDay);
+                const durationInMs = spTask.timeEstimate;
+                const durationInHours = durationInMs / (1000 * 60 * 60);
+
+                let endDateString;
+
+                if (durationInHours < 24) {
+                    // Duration less than 24h - same day
+                    endDateString = spTask.dueDay;
+                    log(`   📅 Date with short duration: ${spTask.dueDay} + ${durationInHours.toFixed(2)}h → same day`);
+                } else {
+                    // Duration 24h or more - calculate end date
+                    const durationInDays = Math.ceil(durationInHours / 24);
+                    const endDate = new Date(startDate);
+                    endDate.setDate(startDate.getDate() + durationInDays);
+                    endDateString = endDate.toISOString().split('T')[0];
+                    log(`   📅 Date with long duration: ${spTask.dueDay} + ${durationInHours.toFixed(2)}h → ${spTask.dueDay} to ${endDateString}`);
+                }
+
+                return {
+                    start: spTask.dueDay,
+                    end: endDateString,
+                    time_zone: null // No timezone for date-only entries
+                };
+            }
+            // Case 2: SP has dueWithTime without timeEstimate
+            else if (spTask.dueWithTime && (!spTask.timeEstimate || spTask.timeEstimate <= 0)) {
+                const localDate = new Date(spTask.dueWithTime);
+                log(`   🕐 Converting SP time: ${localDate.toLocaleString()} (${spTask.dueWithTime})`);
+                log(`   🕐 SP timestamp represents: ${localDate.toString()}`);
+
+                // CRITICAL: SP timestamps are in local time, but toISOString() converts to UTC
+                // We need to adjust for the timezone offset to get the correct UTC time for Notion
+                const timezoneOffsetMs = localDate.getTimezoneOffset() * 60000;
+                const correctedUtcTime = spTask.dueWithTime - timezoneOffsetMs;
+                const correctedDate = new Date(correctedUtcTime);
+                const utcISO = correctedDate.toISOString();
+
+                log(`   🔧 Timezone offset: ${localDate.getTimezoneOffset()} minutes`);
+                log(`   🔧 Corrected UTC time: ${correctedDate.toString()}`);
+                log(`   📤 Sending to Notion: ${utcISO} with timezone ${systemTimezone}`);
+
+                return {
+                    start: utcISO,
+                    end: null,
+                    time_zone: systemTimezone
+                };
+            }
+            // Case 3: SP has dueWithTime + timeEstimate
+            else if (spTask.dueWithTime && spTask.timeEstimate > 0) {
+                const startDate = new Date(spTask.dueWithTime);
+                const endDate = new Date(spTask.dueWithTime + spTask.timeEstimate);
+
+                log(`   🕐 Converting SP time range: ${startDate.toLocaleString()} → ${endDate.toLocaleString()}`);
+
+                // Apply same timezone correction to both start and end
+                const timezoneOffsetMs = startDate.getTimezoneOffset() * 60000;
+                const correctedStartTime = spTask.dueWithTime - timezoneOffsetMs;
+                const correctedEndTime = (spTask.dueWithTime + spTask.timeEstimate) - timezoneOffsetMs;
+
+                const correctedStartDate = new Date(correctedStartTime);
+                const correctedEndDate = new Date(correctedEndTime);
+
+                const startUTC = correctedStartDate.toISOString();
+                const endUTC = correctedEndDate.toISOString();
+
+                log(`   🔧 Corrected times: ${correctedStartDate.toString()} → ${correctedEndDate.toString()}`);
+                log(`   📤 Sending to Notion: ${startUTC} → ${endUTC} with timezone ${systemTimezone}`);
+
+                return {
+                    start: startUTC,
+                    end: endUTC,
+                    time_zone: systemTimezone
+                };
+            }
+            // Case 4: No scheduling
+            else {
+                return null;
+            }
+        }
+
+        // Compare scheduling objects for equality
+        function schedulingEquals(current, newScheduling) {
+            if (!current && !newScheduling) return true;
+            if (!current || !newScheduling) return false;
+
+            return current.start === newScheduling.start &&
+                   current.end === newScheduling.end;
+        }
+
 
         // Helper functions for Status field mapping
         function getNotionStatusFromSp(spTask) {
@@ -1062,20 +1153,6 @@
             await PluginAPI.updateTask(taskId, updates);
         }
 
-        // Helper functions
-        function getSpTaskUpdates(currentTask, newTaskData) {
-            const updates = {};
-
-            if (currentTask.title !== newTaskData.title) updates.title = newTaskData.title;
-            if (currentTask.notes !== newTaskData.notes) updates.notes = newTaskData.notes;
-            if (currentTask.isDone !== newTaskData.isDone) updates.isDone = newTaskData.isDone;
-            if (currentTask.timeEstimate !== newTaskData.timeEstimate) updates.timeEstimate = newTaskData.timeEstimate;
-            if (currentTask.timeSpent !== newTaskData.timeSpent) updates.timeSpent = newTaskData.timeSpent;
-            if (currentTask.priority !== newTaskData.priority) updates.priority = newTaskData.priority;
-            if (currentTask.plannedAt !== newTaskData.plannedAt) updates.plannedAt = newTaskData.plannedAt;
-
-            return updates;
-        }
 
         async function createNotionTask(properties) {
             const response = await fetch('https://api.notion.com/v1/pages', {
@@ -1099,6 +1176,8 @@
         }
 
         async function updateNotionTask(pageId, properties) {
+            log(`   📤 Updating Notion page ${pageId} with properties: ${JSON.stringify(properties, null, 2)}`);
+
             const response = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
                 method: 'PATCH',
                 headers: {
@@ -1110,7 +1189,9 @@
             });
 
             if (!response.ok) {
-                throw new Error(`Failed to update Notion task: ${response.statusText}`);
+                const errorText = await response.text();
+                log(`   ❌ Notion API error ${response.status}: ${errorText}`, 'error');
+                throw new Error(`Failed to update Notion task: ${response.status} - ${errorText}`);
             }
 
             return await response.json();
