@@ -4,373 +4,496 @@ This file provides guidance to Claude Code when working with the Notion Sync Plu
 
 ## Project Overview
 
-The Notion Sync Plugin enables bidirectional synchronization between Super Productivity tasks and Notion databases. It provides real-time sync capabilities, conflict resolution, and a comprehensive user interface for configuration and monitoring.
+The Notion Sync Plugin enables bidirectional synchronization between Super Productivity tasks and Notion databases. It's currently in **alpha testing phase** with a focus on stability, user experience, and comprehensive error handling.
 
-## Architecture
+## Architecture Overview
 
 ### Core Components
 
-1. **plugin.js**: Main plugin logic with sync engine and API integration
+1. **plugin.js**: Main plugin entry point handling all background operations
+   - Plugin initialization and configuration management
+   - Auto-sync engine with configurable intervals (5min-2hr)
+   - Manual sync header button registration
+   - Task hooks (complete, update, delete) for real-time sync
+   - App lifecycle hooks (finish day, window focus)
+   - Comprehensive sync operations and API integration
+   - Configuration monitoring with state tracking
+
 2. **index.html**: User interface for configuration and monitoring
-3. **manifest.json**: Plugin metadata and permissions
-4. **icon.svg**: Plugin visual identifier
+   - Clean, responsive configuration form
+   - Real-time connection status indicators
+   - Auto-discovery of Notion databases
+   - Configuration import/export functionality
+   - Logging controls and debug interface
 
-### Key Features
+3. **manifest.json**: Plugin metadata defining permissions and hooks
+   - Required permissions for task/project/tag operations
+   - Hooks for real-time sync triggers
+   - Super Productivity v14.0.0+ compatibility
 
-- **Bidirectional Sync**: SP ↔ Notion task synchronization
-- **Auto-sync**: Configurable automatic synchronization
-- **Conflict Resolution**: Multiple strategies for handling conflicts
-- **Rich Data Mapping**: Comprehensive property mapping
-- **Error Handling**: Robust error handling with retry logic
+### Key Features Implementation
+
+#### Auto-Sync Engine
+- Configurable intervals: Never, 5min, 10min, 15min, 30min, 1hr, 2hr
+- Rate limiting with 5-second minimum between syncs
+- Configuration monitoring to start/stop based on settings
+- Graceful handling of network issues and API limits
+
+#### Manual Sync System
+- Header button using `PluginAPI.registerHeaderButton()`
+- Immediate sync with progress feedback via `PluginAPI.showSnack()`
+- Rate limiting to prevent rapid-fire requests
+- Comprehensive error handling and user notifications
+
+#### Data Persistence
+- Uses Super Productivity's `persistDataSynced`/`loadSyncedData` API
+- Structured data with versioning and metadata
+- Read-modify-write pattern to prevent data corruption
+- Automatic configuration synchronization between UI and background
+
+#### Database Discovery
+- Automatic discovery of Notion databases by title patterns
+- Schema validation to ensure compatibility
+- Support for tasks and projects databases
+- User feedback about discovery results
 
 ## Development Guidelines
 
-### Code Style
+### Code Style and Patterns
 
-- Use modern JavaScript (ES6+) features
-- Maintain clear separation between API logic and UI
-- Follow Super Productivity plugin patterns
-- Use meaningful variable names and comments
-- Handle errors gracefully with user feedback
+1. **Modern JavaScript**: Use ES6+ features (async/await, arrow functions, destructuring)
+2. **Error Handling**: Always wrap API calls in try-catch with user feedback
+3. **Logging**: Use consistent logging patterns with debug mode support
+4. **Rate Limiting**: Respect API limits with built-in delays and checks
+5. **User Feedback**: Provide clear status updates via `PluginAPI.showSnack()`
 
-### Plugin Structure
+### Plugin API Integration
 
+#### Configuration Management
+```javascript
+// Always load fresh data first
+const currentData = await PluginAPI.loadSyncedData();
+const parsedData = JSON.parse(currentData);
+
+// Update specific sections
+const updatedData = {
+    ...parsedData,
+    config: { ...parsedData.config, ...configUpdates }
+};
+
+// Save back
+await PluginAPI.persistDataSynced(JSON.stringify(updatedData));
 ```
-notion-sync-plugin/
-├── manifest.json       # Plugin metadata
-├── plugin.js          # Main plugin logic
-├── index.html         # UI interface
-├── icon.svg           # Plugin icon
-├── README.md          # User documentation
-├── TEST_PLAN.md       # Testing procedures
-└── CLAUDE.md          # This file
+
+#### Header Button Registration
+```javascript
+PluginAPI.registerHeaderButton({
+    label: 'Sync Notion',
+    icon: 'sync',
+    onClick: async () => {
+        await performManualSync();
+    }
+});
 ```
 
-### Configuration Management
+#### Hook Registration
+```javascript
+// Task completion hook for real-time sync
+PluginAPI.registerHook(PluginAPI.Hooks.TASK_COMPLETE, async (task) => {
+    if (pluginConfig.configured) {
+        await handleTaskCompletion(task);
+    }
+});
+```
 
-The plugin uses Super Productivity's data persistence API:
+### Auto-Sync Implementation
 
-- `PluginAPI.persistDataSynced()`: Save configuration data
-- `PluginAPI.loadSyncedData()`: Load configuration data
-- Configuration keys:
-  - `notionSyncConfig`: Main plugin settings
-  - `notionSyncMappings`: Task ID mappings
-  - `notionLastSyncTime`: Last successful sync timestamp
+#### Timer Management
+```javascript
+function startAutoSync() {
+    if (!pluginConfig.configured || pluginConfig.autoSyncInterval <= 0) {
+        return; // Don't start if not configured or disabled
+    }
+
+    stopAutoSync(); // Clear existing timer
+
+    let intervalMs = pluginConfig.autoSyncInterval * 60 * 1000;
+    if (intervalMs < 60000) intervalMs = 60000; // 1-minute minimum
+
+    autoSyncTimer = setInterval(async () => {
+        if (pluginConfig.configured && pluginConfig.autoSyncInterval > 0) {
+            await performAutoSync();
+        }
+    }, intervalMs);
+}
+```
+
+#### Rate Limiting
+```javascript
+async function performAutoSync() {
+    // Multiple validation layers
+    if (!pluginConfig.configured) return;
+    if (pluginConfig.autoSyncInterval <= 0) return;
+
+    // Prevent too frequent syncs
+    const now = Date.now();
+    if (now - lastSyncTime < MIN_SYNC_INTERVAL) {
+        console.log('[Notion Sync] Rate limited, skipping auto-sync');
+        return;
+    }
+
+    // Proceed with sync...
+}
+```
 
 ### Notion API Integration
 
-#### API Configuration (Currently Hardcoded)
-
-```javascript
-const NOTION_CONFIG = {
-  apiKey: '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',
-  version: '2022-06-28',
-  tasksDatabaseId: '2746194e-7199-8183-86ba-cacb567b74e0',
-  projectsDatabaseId: '2746194e-7199-8191-9a6e-d6e91211dd89',
-  topicsDatabaseId: '2746194e-7199-8125-9e98-fa50ef225336'
-};
-```
-
-#### API Helper Function
-
+#### Request Helper Pattern
 ```javascript
 async function notionRequest(endpoint, method = 'GET', body = null) {
-  // Handles authentication, headers, and error handling
-  // Returns parsed JSON response
+    const response = await fetch(`https://api.notion.com/v1/${endpoint}`, {
+        method,
+        headers: {
+            'Authorization': `Bearer ${pluginConfig.apiKey}`,
+            'Notion-Version': '2022-06-28',
+            'Content-Type': 'application/json'
+        },
+        body: body ? JSON.stringify(body) : null
+    });
+
+    if (!response.ok) {
+        throw new Error(`Notion API error: ${response.status}`);
+    }
+
+    return response.json();
 }
 ```
 
-### Data Mapping
+#### Database Schema Validation
+```javascript
+async function verifyTasksDatabase(apiKey, databaseId) {
+    try {
+        const db = await notionRequest(`databases/${databaseId}`);
+        const props = db.properties || {};
+
+        // Check required properties
+        const hasName = props['Name']?.type === 'title';
+        const hasSpTaskId = props['SP Task ID']?.type === 'rich_text';
+        const hasComplete = props['Complete']?.type === 'checkbox';
+
+        return hasName && hasSpTaskId && hasComplete;
+    } catch (error) {
+        return false;
+    }
+}
+```
+
+### Data Mapping Patterns
 
 #### SP Task to Notion Properties
+```javascript
+function spTaskToNotionProperties(task) {
+    const properties = {};
 
-Key mappings:
-- `title` → `Name` (Title)
-- `notes` → `Notes` (Rich Text)
-- `isDone` → `Complete` (Checkbox) and `Status` (Status)
-- `timeEstimate` → `Time Estimate` (Number, ms to hours)
-- `timeSpent` → `Time Spent` (Number, ms to hours)
-- `priority` → `Priority` (Select)
-- `plannedAt` → `Scheduling` (Date)
-- `projectId` → `Areas` (Relation)
-- `tagIds` → `Task Type` (Multi-select)
+    // Required mappings
+    if (task.title) {
+        properties['Name'] = {
+            title: [{ text: { content: task.title } }]
+        };
+    }
 
-#### Notion Page to SP Task
+    // Optional mappings with null checks
+    if (task.notes) {
+        properties['Notes'] = {
+            rich_text: [{ text: { content: task.notes } }]
+        };
+    }
 
-Reverse mapping with proper type conversion and null handling.
+    // Boolean mappings
+    properties['Complete'] = {
+        checkbox: task.isDone || false
+    };
 
-### Sync Logic
+    // Time conversions (ms to hours)
+    if (task.timeEstimate) {
+        properties['Time Estimate'] = {
+            number: Math.round(task.timeEstimate / 3600000 * 100) / 100
+        };
+    }
 
-#### Main Sync Function
+    return properties;
+}
+```
 
+### Error Handling Patterns
+
+#### Comprehensive Error Catching
 ```javascript
 async function performSync() {
-  // 1. Test connection
-  // 2. Sync SP tasks to Notion
-  // 3. Sync Notion tasks to SP
-  // 4. Handle conflicts
-  // 5. Update mappings
-  // 6. Save state
+    try {
+        // Sync operations...
+
+        PluginAPI.showSnack({
+            msg: 'Sync completed successfully!',
+            type: 'SUCCESS',
+            ico: 'check_circle'
+        });
+
+    } catch (error) {
+        console.error('[Notion Sync] Sync failed:', error);
+
+        PluginAPI.showSnack({
+            msg: `Sync failed: ${error.message}`,
+            type: 'ERROR'
+        });
+
+        // Don't throw - handle gracefully
+    }
 }
 ```
 
-#### Conflict Resolution
+#### Network Error Handling
+```javascript
+async function handleNetworkError(error, operation) {
+    if (error.message.includes('rate limit') || error.message.includes('429')) {
+        console.log('[Notion Sync] Rate limited, will retry later');
+        return { retry: true, delay: 60000 }; // Wait 1 minute
+    }
 
-Four strategies implemented:
-1. **lastModifiedWins**: Compare timestamps
-2. **spWins**: SP changes take precedence
-3. **notionWins**: Notion changes take precedence
-4. **prompt**: Ask user to choose
+    if (error.message.includes('network') || error.message.includes('fetch')) {
+        console.log('[Notion Sync] Network error, check connection');
+        return { retry: true, delay: 30000 }; // Wait 30 seconds
+    }
 
-### UI Implementation
+    // Other errors - don't retry
+    return { retry: false };
+}
+```
 
-#### HTML Structure
+### UI Implementation Guidelines
 
-- Semantic HTML with accessibility considerations
-- Responsive design using CSS Grid and Flexbox
-- Form validation and user feedback
-- Real-time status updates
-
-#### CSS Guidelines
-
-- Use CSS custom properties for theming
-- Mobile-first responsive design
-- Consistent spacing and typography
+#### Responsive Design
+- Use CSS Grid and Flexbox for layout
+- Mobile-first approach with proper viewport handling
+- Consistent spacing using CSS custom properties
 - Material Design inspired components
-- Dark/light theme considerations
 
-#### JavaScript Patterns
-
-- Event-driven architecture
-- Async/await for API calls
-- Error boundaries for robust UX
-- Progressive enhancement
-
-### Error Handling
-
-#### Network Errors
-
-- Connection timeout handling
-- Rate limiting respect
-- Retry logic with exponential backoff
-- User-friendly error messages
-
-#### Data Validation
-
-- Type checking for all API responses
-- Graceful handling of missing properties
-- Validation before saving to SP
-- Circular reference prevention
-
-#### User Feedback
-
-- Toast notifications for operations
-- Progress indicators for long operations
-- Clear error messages with actionable advice
-- Status indicators for connection state
-
-## Testing Strategy
-
-### Manual Testing
-
-Use the comprehensive TEST_PLAN.md for manual testing procedures covering:
-- Plugin installation and setup
-- Configuration management
-- Bidirectional sync functionality
-- Data mapping and conversion
-- Conflict resolution
-- Error handling
-- Performance testing
-
-### Test Data
-
-Create varied test scenarios:
-- Simple tasks (title only)
-- Complex tasks (all properties)
-- Unicode and special characters
-- Large datasets (100+ tasks)
-- Edge cases (empty values, very long strings)
-
-### Debugging
-
-Enable debug mode for detailed logging:
+#### Form Validation
 ```javascript
-if (pluginConfig.debugMode) {
-  console.log('Debug info:', data);
+// Client-side validation before API calls
+function validateConfiguration() {
+    const apiKey = elements.apiKey.value.trim();
+    const tasksDatabaseId = elements.tasksDatabaseId.value.trim();
+
+    if (!apiKey.startsWith('ntn_')) {
+        throw new Error('API Key should start with "ntn_"');
+    }
+
+    const uuidRegex = /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i;
+    if (tasksDatabaseId && !uuidRegex.test(tasksDatabaseId)) {
+        throw new Error('Invalid Database ID format. Should be a UUID.');
+    }
 }
 ```
 
-## Common Development Tasks
-
-### Adding New Property Mappings
-
-1. Update `spTaskToNotionProperties()` function
-2. Update `notionPageToSpTask()` function
-3. Add UI configuration if needed
-4. Update documentation
-5. Add test cases
-
-### Implementing New Conflict Resolution Strategy
-
-1. Add option to `conflictResolution` select
-2. Implement logic in sync functions
-3. Add user documentation
-4. Test with conflicting data
-
-### Performance Optimization
-
-1. Batch API requests when possible
-2. Implement proper rate limiting
-3. Use efficient data structures
-4. Monitor memory usage
-5. Optimize UI updates
-
-### Error Handling Enhancement
-
-1. Identify new error scenarios
-2. Implement specific handling
-3. Provide actionable user messages
-4. Log for debugging
-5. Test recovery scenarios
-
-## Database Schema Requirements
-
-### Required Notion Database Properties
-
-The plugin expects specific property names and types in the Notion database. When making changes:
-
-1. **Required Properties**:
-   - `Name` (Title)
-   - `SP Task ID` (Rich Text)
-   - `Complete` (Checkbox)
-
-2. **Optional Properties**:
-   - `Notes` (Rich Text)
-   - `Status` (Status)
-   - `Priority` (Select with: Urgent, High, Medium, Low)
-   - `Scheduling` (Date)
-   - `Time Estimate` (Number)
-   - `Time Spent` (Number)
-   - `Task Type` (Multi-select)
-   - `Areas` (Relation to Areas database)
-   - `Projects` (Relation to Projects database)
-
-### Schema Validation
-
-The plugin should validate database schema on connection:
+#### Status Updates
 ```javascript
-async function validateDatabaseSchema(databaseId) {
-  // Check required properties exist
-  // Validate property types
-  // Return validation results
+function updateConnectionStatus(isConnected) {
+    const statusElement = document.getElementById('connectionStatus');
+
+    if (isConnected) {
+        statusElement.textContent = 'Connected';
+        statusElement.className = 'status-indicator status-connected';
+    } else {
+        statusElement.textContent = 'Not Connected';
+        statusElement.className = 'status-indicator status-disconnected';
+    }
+}
+```
+
+## Testing and Debugging
+
+### Debug Mode
+Enable comprehensive logging by setting `enableLogging: true` in configuration:
+```javascript
+function log(message, type = 'info') {
+    if (pluginConfig.enableLogging) {
+        console.log(`[Notion Sync] ${message}`);
+    }
+}
+```
+
+### Common Debug Scenarios
+1. **Configuration Issues**: Check persistent data structure and API availability
+2. **Sync Failures**: Enable logging and check network requests
+3. **Timer Issues**: Monitor auto-sync interval settings and rate limiting
+4. **Data Mapping**: Verify property types and null handling
+
+### Performance Monitoring
+```javascript
+async function performSyncWithTiming() {
+    const startTime = Date.now();
+
+    try {
+        const results = await performBidirectionalSync();
+        const duration = Date.now() - startTime;
+
+        console.log(`[Notion Sync] Sync completed in ${duration}ms`);
+        console.log(`[Notion Sync] Results:`, results);
+
+    } catch (error) {
+        const duration = Date.now() - startTime;
+        console.error(`[Notion Sync] Sync failed after ${duration}ms:`, error);
+    }
 }
 ```
 
 ## Security Considerations
 
-### API Key Management
-
-- Currently hardcoded for development
-- Future: User-provided keys stored securely
-- Never log or expose API keys
-- Validate key format before use
+### API Key Handling
+- Never log API keys in console output
+- Store keys securely using Super Productivity's persistence API
+- Validate key format before making API calls
+- Provide clear error messages without exposing keys
 
 ### Data Privacy
-
-- All data remains between user's SP and Notion
-- No third-party data transmission
-- Local storage for configuration
+- All data remains between user's SP instance and their Notion workspace
+- No third-party data transmission or storage
 - Respect user's data deletion requests
+- Use HTTPS for all API communication
 
 ### Input Validation
-
-- Sanitize all user inputs
-- Validate API responses
-- Prevent injection attacks
-- Handle malformed data gracefully
-
-## Future Enhancements
-
-### Planned Features
-
-1. **User-Configurable API Keys**: Remove hardcoded credentials
-2. **Multiple Database Support**: Sync with multiple Notion databases
-3. **Advanced Conflict Resolution**: More sophisticated merge strategies
-4. **Subtask Support**: Handle nested task relationships
-5. **Batch Operations**: Optimize performance for large datasets
-6. **Real-time Sync**: WebSocket or webhook integration
-7. **Sync Analytics**: Detailed performance metrics
-8. **Mobile Optimization**: Better mobile device support
-
-### Technical Debt
-
-1. **Error Handling**: More specific error types and recovery
-2. **Testing**: Automated test suite
-3. **Performance**: Benchmark and optimize
-4. **Documentation**: API documentation
-5. **Security**: Security audit and improvements
-
-## Troubleshooting Guide
-
-### Common Issues
-
-1. **Plugin Not Loading**
-   - Check manifest.json syntax
-   - Verify minSupVersion compatibility
-   - Check console for errors
-
-2. **Sync Failures**
-   - Verify API key and permissions
-   - Check database schema
-   - Review network connectivity
-
-3. **Performance Issues**
-   - Reduce sync frequency
-   - Clear old mappings
-   - Disable debug mode
-
-4. **Data Inconsistencies**
-   - Check conflict resolution settings
-   - Verify property mappings
-   - Review sync logs
-
-### Debug Commands
-
 ```javascript
-// Check plugin state
-console.log('Plugin config:', pluginConfig);
-console.log('Sync mappings:', [...syncMappings.entries()]);
+function sanitizeInput(input) {
+    if (typeof input !== 'string') return '';
 
-// Test Notion connection
-testNotionConnection().then(console.log);
+    // Basic sanitization
+    return input.trim().slice(0, 1000); // Limit length
+}
 
-// Manual sync with debug
-pluginConfig.debugMode = true;
-performSync();
+function validateUUID(uuid) {
+    const uuidRegex = /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i;
+    return uuidRegex.test(uuid);
+}
 ```
 
-## Version History
+## Future Development
 
-- **v1.0.0**: Initial implementation with core bidirectional sync
-- Future versions will be documented here
+### Planned Enhancements
+1. **Subtask Support**: Handle nested task relationships
+2. **Multiple Databases**: Support for multiple Notion databases
+3. **Advanced Conflict Resolution**: More sophisticated merge strategies
+4. **Real-time Sync**: WebSocket/webhook integration
+5. **Performance Optimization**: Batch operations and caching
 
-## Contributing
+### Architecture Improvements
+1. **Modular Structure**: Split large functions into focused modules
+2. **Type Safety**: Consider TypeScript migration for better type checking
+3. **Test Coverage**: Add automated testing for critical functions
+4. **Documentation**: API documentation for sync functions
 
-When contributing to this plugin:
+### Plugin API Evolution
+- Monitor Super Productivity plugin API updates
+- Adopt new hooks and permissions as they become available
+- Maintain backward compatibility with older SP versions
+- Consider performance improvements in data persistence
 
-1. Follow the existing code patterns
-2. Add appropriate error handling
-3. Update tests and documentation
-4. Consider performance implications
-5. Test thoroughly with the test plan
+## Troubleshooting Common Development Issues
 
-## Resources
+### PluginAPI Timing
+```javascript
+// Always wait for PluginAPI to be available
+function waitForPluginAPI() {
+    return new Promise((resolve) => {
+        if (typeof PluginAPI !== 'undefined') {
+            resolve();
+            return;
+        }
 
-- [Super Productivity Plugin API](https://github.com/johannesjo/super-productivity/blob/master/docs/plugin-development.md)
-- [Notion API Documentation](https://developers.notion.com/)
-- [Plugin Testing Guidelines](./TEST_PLAN.md)
-- [User Documentation](./README.md)
+        const checkInterval = setInterval(() => {
+            if (typeof PluginAPI !== 'undefined') {
+                clearInterval(checkInterval);
+                resolve();
+            }
+        }, 100);
+
+        setTimeout(() => {
+            clearInterval(checkInterval);
+            resolve(); // Resolve anyway after timeout
+        }, 10000);
+    });
+}
+```
+
+### Configuration Persistence
+```javascript
+// Always use read-modify-write pattern
+async function updateConfigSafely(updates) {
+    const currentData = await PluginAPI.loadSyncedData();
+    const parsedData = currentData ? JSON.parse(currentData) : createDefaultData();
+
+    const updatedData = {
+        ...parsedData,
+        config: { ...parsedData.config, ...updates },
+        metadata: {
+            ...parsedData.metadata,
+            lastModified: new Date().toISOString()
+        }
+    };
+
+    await PluginAPI.persistDataSynced(JSON.stringify(updatedData));
+}
+```
+
+### Rate Limiting Management
+```javascript
+// Implement exponential backoff for API errors
+async function retryWithBackoff(operation, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await operation();
+        } catch (error) {
+            if (attempt === maxRetries) throw error;
+
+            const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
+            console.log(`[Notion Sync] Retry ${attempt} after ${delay}ms`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+}
+```
+
+## Documentation Standards
+
+### Code Comments
+- Document complex business logic and data transformations
+- Explain non-obvious API interactions
+- Provide examples for reusable functions
+- Keep comments up-to-date with code changes
+
+### Logging Standards
+```javascript
+// Consistent logging format
+function log(message, level = 'info', context = null) {
+    if (!pluginConfig.enableLogging) return;
+
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
+
+    if (context) {
+        console.log(logMessage, context);
+    } else {
+        console.log(logMessage);
+    }
+}
+```
+
+### User Documentation
+- Keep README.md updated with new features
+- Provide clear setup instructions
+- Include troubleshooting guides
+- Document breaking changes and migration paths
 
 ---
 
-**Note**: This file should be updated when making significant changes to the plugin architecture or adding new features.
+**Important**: This plugin is in alpha development. Focus on stability, error handling, and user experience. All changes should be thoroughly tested and documented.
