@@ -56,6 +56,16 @@
             color: #166534;
         }
 
+        .status-authenticated {
+            background: #dcfce7;
+            color: #0819af;
+        }
+
+        .status-not-tested {
+            background: #fef3c7;
+            color: #b45309;
+        }
+
         .status-disconnected {
             background: #fef2f2;
             color: #dc2626;
@@ -200,9 +210,9 @@
             <div class="form-group">
                 <label for="autoSyncInterval">Auto-Sync Interval</label>
                 <select id="autoSyncInterval">
-                    <option value="0">Never (Disabled)</option>
+                    <option value="0" selected>Never (Disabled)</option>
                     <option value="5">Every 5 minutes</option>
-                    <option value="10" selected>Every 10 minutes</option>
+                    <option value="10">Every 10 minutes</option>
                     <option value="15">Every 15 minutes</option>
                     <option value="30">Every 30 minutes</option>
                     <option value="60">Every hour</option>
@@ -229,12 +239,23 @@
     </div>
 
     <script>
+        // Connection states
+        const ConnectionState = {
+            INITIAL: 'initial',           // No config or test failed (values kept)
+            NOT_TESTED: 'not_tested',     // API key saved but not tested
+            AUTHENTICATED: 'authenticated', // API key tested successfully
+            CONFIGURED: 'configured'       // API key + databases tested successfully
+        };
+
         // Global state
+        const CONFIG_VERSION = '1.0.1'; // Config format version (state machine implementation)
+
         let pluginConfig = {
+            version: CONFIG_VERSION,
             apiKey: '',
             tasksDatabaseId: '',
             projectsDatabaseId: '',
-            configured: false,
+            connectionState: ConnectionState.INITIAL,
             enableLogging: true,
             autoSyncInterval: 0 // minutes
         };
@@ -266,15 +287,24 @@
 
         // Update UI state
         function updateUI() {
-            const isConfigured = pluginConfig.apiKey && pluginConfig.tasksDatabaseId && pluginConfig.configured;
-
-            // Update connection status
-            if (isConfigured) {
-                elements.connectionStatus.textContent = 'Configured';
-                elements.connectionStatus.className = 'status-indicator status-connected';
-            } else {
-                elements.connectionStatus.textContent = 'Not Configured';
-                elements.connectionStatus.className = 'status-indicator status-disconnected';
+            // Update connection status based on state
+            switch (pluginConfig.connectionState) {
+                case ConnectionState.INITIAL:
+                    elements.connectionStatus.textContent = 'Not Configured';
+                    elements.connectionStatus.className = 'status-indicator status-disconnected';
+                    break;
+                case ConnectionState.NOT_TESTED:
+                    elements.connectionStatus.textContent = 'Not Tested';
+                    elements.connectionStatus.className = 'status-indicator status-not-tested';
+                    break;
+                case ConnectionState.AUTHENTICATED:
+                    elements.connectionStatus.textContent = 'Authenticated';
+                    elements.connectionStatus.className = 'status-indicator status-authenticated';
+                    break;
+                case ConnectionState.CONFIGURED:
+                    elements.connectionStatus.textContent = 'Configured';
+                    elements.connectionStatus.className = 'status-indicator status-connected';
+                    break;
             }
 
             // Update form values
@@ -283,9 +313,32 @@
             elements.projectsDatabaseId.value = pluginConfig.projectsDatabaseId || '';
             elements.autoSyncInterval.value = pluginConfig.autoSyncInterval || 0;
 
-            // Enable/disable buttons
-            elements.discoverDbBtn.disabled = !pluginConfig.apiKey;
-            elements.testConnectionBtn.disabled = !(pluginConfig.apiKey && pluginConfig.tasksDatabaseId);
+            // Enable/disable buttons based on state
+            const hasApiKey = !!pluginConfig.apiKey;
+            const state = pluginConfig.connectionState;
+
+            // Test Connection: enabled in not_tested, authenticated, configured states
+            elements.testConnectionBtn.disabled = !(
+                hasApiKey &&
+                (state === ConnectionState.NOT_TESTED ||
+                 state === ConnectionState.AUTHENTICATED ||
+                 state === ConnectionState.CONFIGURED)
+            );
+
+            // Discover Databases: enabled in authenticated or configured states
+            elements.discoverDbBtn.disabled = !(
+                hasApiKey &&
+                (state === ConnectionState.AUTHENTICATED ||
+                 state === ConnectionState.CONFIGURED)
+            );
+        }
+
+        // Helper function to save config with state transition
+        async function saveConfigWithState(newState) {
+            pluginConfig.connectionState = newState;
+            await updateConfig(pluginConfig);
+            updateUI();
+            log(`State transitioned to: ${newState}`);
         }
 
         // Load configuration from Plugin API
@@ -297,10 +350,11 @@
             } catch (error) {
                 log(`Failed to load configuration: ${error.message}`, 'error');
                 pluginConfig = {
+                    version: CONFIG_VERSION,
                     apiKey: '',
                     tasksDatabaseId: '',
                     projectsDatabaseId: '',
-                    configured: false,
+                    connectionState: ConnectionState.INITIAL,
                     enableLogging: true,
                     autoSyncInterval: 0
                 };
@@ -337,20 +391,35 @@
                     throw new Error('Invalid Projects Database ID format. Should be a UUID.');
                 }
 
+                // Check if test is needed
+                const needsTest = (
+                    apiKey !== pluginConfig.apiKey ||
+                    tasksDatabaseId !== pluginConfig.tasksDatabaseId ||
+                    projectsDatabaseId !== pluginConfig.projectsDatabaseId
+                );
+
+                const actualConnectionState = pluginConfig.connectionState;
+
                 // Update configuration
                 pluginConfig = {
+                    version: CONFIG_VERSION,
                     apiKey: apiKey,
                     tasksDatabaseId: tasksDatabaseId || '',
                     projectsDatabaseId: projectsDatabaseId || '',
                     enableLogging: enableLogging,
-                    autoSyncInterval: autoSyncInterval,
-                    configured: !!(apiKey && tasksDatabaseId) // Only configured if both API key and tasks DB are present
+                    autoSyncInterval: autoSyncInterval
                 };
 
-                // Save to Plugin API using optimized persistence
-                await updateConfig(pluginConfig);
 
-                updateUI();
+                // Save to Plugin API using optimized persistence
+                if (needsTest) {
+                    log('Notion configuration changed, please test the connection');
+                    await saveConfigWithState(ConnectionState.NOT_TESTED);
+                    testConnection();
+                } else {
+                    await saveConfigWithState(actualConnectionState);
+                }
+
                 log('Configuration saved successfully');
 
                 if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
@@ -369,6 +438,8 @@
                         type: 'ERROR'
                     });
                 }
+            } finally {
+                updateUI();
             }
         }
 
@@ -411,18 +482,22 @@
 
         // Test connection to Notion (UI function)
         async function testConnection() {
+            let apiAuthSucceeded = false; // Track if API authentication worked
+
             try {
                 elements.testConnectionBtn.disabled = true;
+                elements.discoverDbBtn.disabled = true;
                 elements.testConnectionBtn.textContent = 'Testing...';
 
                 log('Testing Notion connection...');
 
-                if (!pluginConfig.apiKey || !pluginConfig.tasksDatabaseId) {
-                    throw new Error('API Key and Database ID are required');
+                if (!pluginConfig.apiKey) {
+                    throw new Error('API Key is required');
                 }
 
-                // Test connection by getting database info
-                const response = await fetch(`https://api.notion.com/v1/databases/${pluginConfig.tasksDatabaseId}`, {
+                // STEP 1: Test API Key authentication
+                log('Testing API authentication...');
+                const authResponse = await fetch('https://api.notion.com/v1/users/me', {
                     method: 'GET',
                     headers: {
                         'Authorization': `Bearer ${pluginConfig.apiKey}`,
@@ -430,46 +505,121 @@
                     }
                 });
 
-                if (!response.ok) {
-                    const errorData = await response.text();
-                    throw new Error(`API Error (${response.status}): ${errorData}`);
+                if (!authResponse.ok) {
+                    // Special handling for 401 errors
+                    if (authResponse.status === 401) {
+                        throw new Error('UNAUTHORIZED');
+                    }
+                    const errorData = await authResponse.text();
+                    throw new Error(`API Error (${authResponse.status}): ${errorData}`);
                 }
 
-                const dbData = await response.json();
+                apiAuthSucceeded = true; // Mark API auth as successful
+                log('API authentication successful!');
 
-                // Update configuration state
-                pluginConfig.configured = true;
+                // STEP 2: Test databases if IDs are provided
+                const hasTasksDb = !!pluginConfig.tasksDatabaseId;
+                const hasProjectsDb = !!pluginConfig.projectsDatabaseId;
 
-                elements.connectionStatus.textContent = 'Connected';
-                elements.connectionStatus.className = 'status-indicator status-connected';
+                if (hasTasksDb && hasProjectsDb) {
+                    log('Testing database access...');
 
-                log('Connection test successful!');
-                log(`Database: ${dbData.title?.[0]?.plain_text || 'Unknown'}`);
-
-                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
-                    PluginAPI.showSnack({
-                        msg: 'Connection test successful!',
-                        type: 'SUCCESS'
+                    // Test Tasks Database
+                    const tasksDbResponse = await fetch(`https://api.notion.com/v1/databases/${pluginConfig.tasksDatabaseId}`, {
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                            'Notion-Version': '2022-06-28'
+                        }
                     });
-                }
 
-                // Update UI state after successful connection
-                updateUI();
+                    if (!tasksDbResponse.ok) {
+                        if (tasksDbResponse.status === 401) {
+                            throw new Error('UNAUTHORIZED');
+                        }
+                        const errorData = await tasksDbResponse.text();
+                        throw new Error(`Tasks Database Error (${tasksDbResponse.status}): ${errorData}`);
+                    }
+
+                    const tasksDbData = await tasksDbResponse.json();
+                    log(`Tasks Database: ${tasksDbData.title?.[0]?.plain_text || 'Unknown'}`);
+
+                    // Test Projects Database
+                    const projectsDbResponse = await fetch(`https://api.notion.com/v1/databases/${pluginConfig.projectsDatabaseId}`, {
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                            'Notion-Version': '2022-06-28'
+                        }
+                    });
+
+                    if (!projectsDbResponse.ok) {
+                        if (projectsDbResponse.status === 401) {
+                            throw new Error('UNAUTHORIZED');
+                        }
+                        const errorData = await projectsDbResponse.text();
+                        throw new Error(`Projects Database Error (${projectsDbResponse.status}): ${errorData}`);
+
+                    }
+
+                    // SUCCESS with databases -> CONFIGURED
+                    await saveConfigWithState(ConnectionState.CONFIGURED);
+                    log('Connection test successful - Configured!');
+
+                    if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                        PluginAPI.showSnack({
+                            msg: 'Connection test successful! Plugin is fully configured.',
+                            type: 'SUCCESS'
+                        });
+                    }
+                } else {
+                    // SUCCESS without databases -> AUTHENTICATED
+                    await saveConfigWithState(ConnectionState.AUTHENTICATED);
+                    log('Connection test successful - Authenticated!');
+
+                    if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                        PluginAPI.showSnack({
+                            msg: 'API key authenticated! Add database IDs or use Discover Databases.',
+                            type: 'SUCCESS'
+                        });
+                    }
+                }
 
             } catch (error) {
-                elements.connectionStatus.textContent = 'Connection Failed';
-                elements.connectionStatus.className = 'status-indicator status-disconnected';
+                // SMART FALLBACK: Based on what succeeded
+                if (apiAuthSucceeded) {
+                    // API worked but databases failed -> fallback to AUTHENTICATED
+                    await saveConfigWithState(ConnectionState.AUTHENTICATED);
+                    log('API authentication succeeded, but database test failed. State: AUTHENTICATED');
+                } else {
+                    // API failed -> fallback to INITIAL
+                    pluginConfig.apiKey = ''; // Clear invalid API key
+                    pluginConfig.tasksDatabaseId = ''; // Clear invalid Tasks database ID
+                    pluginConfig.projectsDatabaseId = ''; // Clear invalid Projects database ID
+                    await saveConfigWithState(ConnectionState.INITIAL);
+                    log('API authentication failed. State: INITIAL');
+                }
 
                 log(`Connection test failed: ${error.message}`, 'error');
 
                 if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
-                    PluginAPI.showSnack({
-                        msg: `Connection failed: ${error.message}`,
-                        type: 'ERROR'
-                    });
+                    // Special message for 401 errors
+                    if (error.message === 'UNAUTHORIZED') {
+                        PluginAPI.showSnack({
+                            msg: 'API key is wrong. Please check your Notion integration token.',
+                            type: 'ERROR'
+                        });
+                    } else {
+                        PluginAPI.showSnack({
+                            msg: `Connection failed: ${error.message}`,
+                            type: 'ERROR'
+                        });
+                    }
                 }
             } finally {
-                elements.testConnectionBtn.disabled = false;
+                if (apiAuthSucceeded) {
+                    elements.testConnectionBtn.disabled = false;
+                }
                 elements.testConnectionBtn.textContent = 'Test Connection';
             }
         }
@@ -478,26 +628,30 @@
         async function discoverDatabases() {
             try {
                 elements.discoverDbBtn.disabled = true;
+                elements.testConnectionBtn.disabled = true;
                 elements.discoverDbBtn.textContent = 'Discovering...';
 
                 log('Starting manual database discovery...');
+
+                // Check state requirements
+                const state = pluginConfig.connectionState;
+                if (state !== ConnectionState.AUTHENTICATED && state !== ConnectionState.CONFIGURED) {
+                    throw new Error('Please test your API connection first');
+                }
 
                 if (!pluginConfig.apiKey) {
                     throw new Error('API Key is required');
                 }
 
-                // Save current API key first
+                // Save current form values first
                 pluginConfig.apiKey = elements.apiKey.value.trim();
+                pluginConfig.tasksDatabaseId = elements.tasksDatabaseId.value.trim();
+                pluginConfig.projectsDatabaseId = elements.projectsDatabaseId.value.trim();
 
                 // Trigger database discovery
-                await initializeDatabaseIds();
+                const discoverySuccessful = await initializeDatabaseIds();
 
-                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
-                    PluginAPI.showSnack({
-                        msg: 'Database discovery completed! Check the log for results.',
-                        type: 'SUCCESS'
-                    });
-                }
+                // Note: initializeDatabaseIds() handles its own success messages and state transitions
 
             } catch (error) {
                 log(`Database discovery failed: ${error.message}`, 'error');
@@ -509,7 +663,7 @@
                     });
                 }
             } finally {
-                elements.discoverDbBtn.disabled = !pluginConfig.apiKey;
+                updateUI(); // Refresh button states
                 elements.discoverDbBtn.textContent = 'Discover Databases';
             }
         }
@@ -644,6 +798,82 @@
             }
         }
 
+        // Perform the actual database discovery logic (extracted for reuse)
+        async function performDatabaseDiscovery() {
+            const discoveries = await discoverDatabaseIds(pluginConfig.apiKey);
+            const discoveryResults = [];
+            let needsSave = false;
+
+            if (discoveries.tasks) {
+                pluginConfig.tasksDatabaseId = discoveries.tasks;
+                elements.tasksDatabaseId.value = discoveries.tasks;
+                log(`✅ Auto-discovered Tasks Database ID: ${discoveries.tasks}`);
+                discoveryResults.push('Tasks database found');
+                needsSave = true;
+            } else {
+                log('⚠️ Tasks database not found - please enter manually');
+                discoveryResults.push('Tasks database NOT found - please enter manually');
+            }
+
+            if (discoveries.projects) {
+                pluginConfig.projectsDatabaseId = discoveries.projects;
+                elements.projectsDatabaseId.value = discoveries.projects;
+                log(`✅ Auto-discovered Projects Database ID: ${discoveries.projects}`);
+                discoveryResults.push('Projects database found');
+                needsSave = true;
+            } else {
+                log('⚠️ Projects database not found - please enter manually');
+                discoveryResults.push('Projects database NOT found - please enter manually');
+            }
+
+            if (needsSave) {
+                // Transition to CONFIGURED state if tasks DB was found
+                const hasTasksDb = !!pluginConfig.tasksDatabaseId;
+                const hasProjectsDb = !!pluginConfig.projectsDatabaseId;
+
+                if (hasTasksDb && hasProjectsDb) {
+                    try {
+                        await saveConfigWithState(ConnectionState.CONFIGURED);
+                        log('Configuration auto-saved after database discovery - CONFIGURED');
+                    } catch (error) {
+                        log(`Failed to auto-save configuration: ${error.message}`, 'error');
+                    }
+                } else {
+                    // Still authenticated but no tasks DB yet
+                    try {
+                        await saveConfigWithState(ConnectionState.AUTHENTICATED);
+                        if (hasTasksDb) {
+                            log('Configuration auto-saved after database discovery - AUTHENTICATED (Projects DB not found)');
+                        } else {
+                            log('Configuration auto-saved after database discovery - AUTHENTICATED (Tasks DB not found)');
+                        }
+                    } catch (error) {
+                        log(`Failed to auto-save configuration: ${error.message}`, 'error');
+                    }
+                }
+            }
+
+            // Show user feedback about discovery results
+            if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
+                const message = discoveryResults.join('. ');
+                const hasSuccess = discoveryResults.some(r => r.includes('found') && !r.includes('NOT'));
+                const hasFailure = discoveryResults.some(r => r.includes('NOT found'));
+
+                PluginAPI.showSnack({
+                    msg: `Database discovery: ${message}`,
+                    type: hasFailure ? (hasSuccess ? 'WARNING' : 'ERROR') : 'SUCCESS'
+                });
+            }
+
+            // Log final status for user
+            if (!pluginConfig.tasksDatabaseId) {
+                log('❌ Tasks Database ID still missing - plugin cannot function without it');
+            }
+            if (!pluginConfig.projectsDatabaseId) {
+                log('⚠️ Projects Database ID missing - project sync will be disabled');
+            }
+        }
+
         // Initialize database IDs (auto-discover if missing)
         async function initializeDatabaseIds() {
             if (!pluginConfig.apiKey) {
@@ -651,82 +881,50 @@
                 return;
             }
 
-            let needsDiscovery = false;
-            let needsSave = false;
-            let discoveryResults = [];
-
-            // Check if Tasks Database ID is missing
-            if (!pluginConfig.tasksDatabaseId) {
-                log('Tasks Database ID not configured, will attempt auto-discovery');
-                needsDiscovery = true;
-            }
-
-            // Check if Projects Database ID is missing
-            if (!pluginConfig.projectsDatabaseId) {
-                log('Projects Database ID not configured, will attempt auto-discovery');
-                needsDiscovery = true;
-            }
+            // Check if we need discovery
+            const needsDiscovery = !pluginConfig.tasksDatabaseId || !pluginConfig.projectsDatabaseId;
 
             if (needsDiscovery) {
-                const discoveries = await discoverDatabaseIds(pluginConfig.apiKey);
-
-                if (discoveries.tasks && !pluginConfig.tasksDatabaseId) {
-                    pluginConfig.tasksDatabaseId = discoveries.tasks;
-                    elements.tasksDatabaseId.value = discoveries.tasks;
-                    log(`✅ Auto-discovered Tasks Database ID: ${discoveries.tasks}`);
-                    discoveryResults.push('Tasks database found');
-                    needsSave = true;
-                } else if (!discoveries.tasks && !pluginConfig.tasksDatabaseId) {
-                    log('⚠️ Tasks database not found - please enter manually');
-                    discoveryResults.push('Tasks database NOT found - please enter manually');
-                }
-
-                if (discoveries.projects && !pluginConfig.projectsDatabaseId) {
-                    pluginConfig.projectsDatabaseId = discoveries.projects;
-                    elements.projectsDatabaseId.value = discoveries.projects;
-                    log(`✅ Auto-discovered Projects Database ID: ${discoveries.projects}`);
-                    discoveryResults.push('Projects database found');
-                    needsSave = true;
-                } else if (!discoveries.projects && !pluginConfig.projectsDatabaseId) {
-                    log('⚠️ Projects database not found - please enter manually');
-                    discoveryResults.push('Projects database NOT found - please enter manually');
-                }
-
-                // Update configuration to mark as configured if tasks DB is available
-                pluginConfig.configured = !!(pluginConfig.apiKey && pluginConfig.tasksDatabaseId);
-
-                if (needsSave) {
-                    // Save configuration automatically after discovery
-                    try {
-                        await updateConfig(pluginConfig);
-                        log('Configuration auto-saved after database discovery');
-                    } catch (error) {
-                        log(`Failed to auto-save configuration: ${error.message}`, 'error');
-                    }
-                    updateUI();
-                }
-
-                // Show user feedback about discovery results
-                if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
-                    const message = discoveryResults.join('. ');
-                    const hasSuccess = discoveryResults.some(r => r.includes('found') && !r.includes('NOT'));
-                    const hasFailure = discoveryResults.some(r => r.includes('NOT found'));
-
-                    PluginAPI.showSnack({
-                        msg: `Database discovery: ${message}`,
-                        type: hasFailure ? (hasSuccess ? 'WARNING' : 'ERROR') : 'SUCCESS'
-                    });
-                }
-
-                // Log final status for user
-                if (!pluginConfig.tasksDatabaseId) {
-                    log('❌ Tasks Database ID still missing - plugin cannot function without it');
-                }
-                if (!pluginConfig.projectsDatabaseId) {
-                    log('⚠️ Projects Database ID missing - project sync will be disabled');
-                }
+                // Directly perform discovery
+                log('Database IDs missing, starting auto-discovery...');
+                await performDatabaseDiscovery();
             } else {
+                // Confirm with user if they want to re-discover
                 log('All database IDs already configured');
+
+
+                // TODO: Activate user confirmation dialog and remove unverified overwrite
+                await performDatabaseDiscovery();
+                // if (typeof PluginAPI !== 'undefined' && PluginAPI.openDialog) {
+                //     const result = PluginAPI.openDialog({
+                //         title: 'Confirm Database Discovery',
+                //         htmlContent: `
+                //             <div style="padding: 20px;">
+                //                 <p>Database IDs are already configured. Do you want to re-discover them?</p>
+                //                 <p style="font-size: 0.9em; color: #666; margin-top: 10px;">
+                //                     This will search for databases and may overwrite your current settings.
+                //                 </p>
+                //             </div>
+                //         `,
+                //         buttons: [
+                //             {
+                //                 label: 'Cancel',
+                //                 color: 'primary',
+                //                 onClick: () => {
+                //                     log('Database re-discovery cancelled by user');
+                //                 }
+                //             },
+                //             {
+                //                 label: 'Re-Discover',
+                //                 color: 'warn',
+                //                 onClick: async () => {
+                //                     log('User confirmed re-discovery of database IDs');
+                //                     await performDatabaseDiscovery();
+                //                 }
+                //             }
+                //         ]
+                //     });
+                // }
             }
         }
 
@@ -837,20 +1035,22 @@
         // Export configuration to file
         async function exportConfiguration() {
             try {
-                if (!pluginConfig.configured) {
+                // Allow export at any state except initial
+                if (pluginConfig.connectionState === ConnectionState.INITIAL) {
                     throw new Error('No configuration to export. Please save configuration first.');
                 }
 
                 const exportData = {
-                    version: "1.0.0",
+                    version: CONFIG_VERSION,
                     exportDate: new Date().toISOString(),
                     configuration: {
+                        version: pluginConfig.version,
                         apiKey: pluginConfig.apiKey, // Export real API key
                         tasksDatabaseId: pluginConfig.tasksDatabaseId,
                         projectsDatabaseId: pluginConfig.projectsDatabaseId,
                         autoSyncInterval: pluginConfig.autoSyncInterval,
                         enableLogging: pluginConfig.enableLogging,
-                        configured: pluginConfig.configured
+                        connectionState: pluginConfig.connectionState
                     }
                 };
 
@@ -937,6 +1137,18 @@
                 elements.autoSyncInterval.value = importConfig.autoSyncInterval || 0;
                 elements.enableLogging.checked = importConfig.enableLogging || false;
 
+                // Update pluginConfig with imported values
+                pluginConfig.version = CONFIG_VERSION; // Always use current version
+                pluginConfig.apiKey = importConfig.apiKey || '';
+                pluginConfig.tasksDatabaseId = importConfig.tasksDatabaseId || '';
+                pluginConfig.projectsDatabaseId = importConfig.projectsDatabaseId || '';
+                pluginConfig.autoSyncInterval = importConfig.autoSyncInterval || 0;
+                pluginConfig.enableLogging = importConfig.enableLogging || false;
+                pluginConfig.connectionState = importConfig.connectionState || ConnectionState.INITIAL;
+
+                // Update UI to reflect imported state
+                updateUI();
+
                 log(`Configuration imported from ${file.name}`);
                 log('Please verify the configuration and save if needed');
 
@@ -946,6 +1158,9 @@
                         type: 'SUCCESS'
                     });
                 }
+
+                // Test connection after import if API key is present
+                testConnection();
 
             } catch (error) {
                 log(`Failed to import configuration: ${error.message}`, 'error');
@@ -993,37 +1208,21 @@
             });
         }
 
-        // Initialize
-        async function initialize() {
-            log('Notion Sync Plugin UI initialized');
 
-            // Wait for PluginAPI to be available
-            await waitForPluginAPI();
-
-            if (typeof PluginAPI !== 'undefined') {
-                log('PluginAPI available, loading configuration...');
-                await loadConfiguration();
-
-                // Auto-connect if configuration exists
-                if (pluginConfig.apiKey && pluginConfig.tasksDatabaseId) {
-                    log('Configuration found, attempting connection...');
-                    const isConnected = await testNotionConnection();
-                    if (isConnected) {
-                        pluginConfig.configured = true;
-                        saveConfiguration();
-                        updateUI();
-                        log('Connection successful');
-                    } else {
-                        log('Connection failed: Invalid credentials or database', 'error');
-                    }
+        // Initialize the UI
+        function initializeUI() {
+            waitForPluginAPI().then(async () => {
+                const dataInitialized = await initializePluginData();
+                if (!dataInitialized) {
+                    log('No existing configuration found, starting fresh');
                 }
-            } else {
-                log('PluginAPI not available after timeout', 'error');
-                updateUI(); // Update UI with defaults
-            }
+                updateUI();
+                log('UI initialized');
+            });
         }
 
-        initialize();
+        // Start initialization
+        initializeUI();
     </script>
 </body>
 

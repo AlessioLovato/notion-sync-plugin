@@ -16,12 +16,9 @@
     "addTask",
     "getAllProjects",
     "addProject",
-    "updateProject",
     "getAllTags",
     "addTag",
-    "updateTag",
     "showSnack",
-    "notify",
     "openDialog",
     "persistDataSynced",
     "loadSyncedData"
