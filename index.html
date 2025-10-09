@@ -183,6 +183,9 @@
                 <h1>Notion Sync Plugin</h1>
                 <span id="connectionStatus" class="status-indicator status-disconnected">Not Configured</span>
             </div>
+            <div class="help-text" style="margin-top: 8px;">
+                Last Sync: <span id="lastSyncTime">Never</span>
+            </div>
         </div>
 
         <!-- Configuration -->
@@ -263,6 +266,7 @@
         // UI Elements
         const elements = {
             connectionStatus: document.getElementById('connectionStatus'),
+            lastSyncTime: document.getElementById('lastSyncTime'),
             apiKey: document.getElementById('apiKey'),
             tasksDatabaseId: document.getElementById('tasksDatabaseId'),
             projectsDatabaseId: document.getElementById('projectsDatabaseId'),
@@ -282,7 +286,80 @@
 
             const timestamp = new Date().toLocaleTimeString();
             const logEntry = `[${timestamp}] ${type.toUpperCase()}: ${message}\n`;
-            console.log(`[Notion Plugin] ${message}`);
+            if (type === 'error') {
+                console.error(`[Notion Plugin UI] ${message}`);
+            } else if (type === 'warning') {
+                console.warn(`[Notion Plugin UI] ${message}`);
+            } else {
+                console.log(`[Notion Plugin UI] ${message}`);
+            }
+        }
+
+        // Send message to plugin.js background using postMessage API
+        async function sendMessage(message) {
+            return new Promise((resolve, reject) => {
+                const messageId = Date.now().toString() + Math.random();
+                const timeout = setTimeout(() => {
+                    window.removeEventListener('message', handler);
+                    reject(new Error('Message timeout'));
+                }, 10000);
+
+                const handler = (event) => {
+                    if (
+                        event.data?.type === 'PLUGIN_MESSAGE_RESPONSE' &&
+                        event.data?.messageId === messageId
+                    ) {
+                        clearTimeout(timeout);
+                        window.removeEventListener('message', handler);
+                        resolve(event.data.result || event.data.response || event.data);
+                    }
+                };
+
+                window.addEventListener('message', handler);
+
+                window.parent.postMessage(
+                    {
+                        type: 'PLUGIN_MESSAGE',
+                        message,
+                        messageId,
+                    },
+                    '*'
+                );
+            });
+        }
+
+        // Update last sync time display
+        async function  updateLastSyncTimeUI() {
+            try {
+                const data = await PluginAPI.loadSyncedData();
+                if (data) {
+                    const parsed = JSON.parse(data);
+                    const lastSyncTime = parsed?.metadata?.lastSyncTime;
+
+                    if (lastSyncTime) {
+                        const date = new Date(lastSyncTime);
+                        const now = new Date();
+                        const diff = now - date;
+
+                        // Format relative time
+                        if (diff < 60000) { // < 1 minute
+                            elements.lastSyncTime.textContent = 'Just now';
+                        } else if (diff < 3600000) { // < 1 hour
+                            const mins = Math.floor(diff / 60000);
+                            elements.lastSyncTime.textContent = `${mins} minute${mins > 1 ? 's' : ''} ago`;
+                        } else if (diff < 86400000) { // < 1 day
+                            const hours = Math.floor(diff / 3600000);
+                            elements.lastSyncTime.textContent = `${hours} hour${hours > 1 ? 's' : ''} ago`;
+                        } else {
+                            elements.lastSyncTime.textContent = date.toLocaleString();
+                        }
+                    } else {
+                        elements.lastSyncTime.textContent = 'Never';
+                    }
+                }
+            } catch (error) {
+                log(`Failed to load last sync time: ${error.message}`, 'error');
+            }
         }
 
         // Update UI state
@@ -306,6 +383,9 @@
                     elements.connectionStatus.className = 'status-indicator status-connected';
                     break;
             }
+
+            // Update last sync time
+             updateLastSyncTimeUI();
 
             // Update form values
             elements.apiKey.value = pluginConfig.apiKey || '';
@@ -421,6 +501,17 @@
                 }
 
                 log('Configuration saved successfully');
+
+                // Send CONFIG_UPDATE message to plugin.js
+                try {
+                    const response = await sendMessage({
+                        type: 'CONFIG_UPDATE',
+                        config: pluginConfig
+                    });
+                    log('Config update message sent to plugin.js: ' + JSON.stringify(response));
+                } catch (error) {
+                    log(`Failed to send config update message (non-critical): ${error.message}`, 'warn');
+                }
 
                 if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
                     PluginAPI.showSnack({
@@ -566,6 +657,17 @@
                     await saveConfigWithState(ConnectionState.CONFIGURED);
                     log('Connection test successful - Configured!');
 
+                    // Send CONFIG_UPDATE message to plugin.js
+                    try {
+                        const response = await sendMessage({
+                            type: 'CONFIG_UPDATE',
+                            config: pluginConfig
+                        });
+                        log('Config update message sent (CONFIGURED): ' + JSON.stringify(response));
+                    } catch (error) {
+                        log(`Failed to send config update (non-critical): ${error.message}`, 'warn');
+                    }
+
                     if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
                         PluginAPI.showSnack({
                             msg: 'Connection test successful! Plugin is fully configured.',
@@ -576,6 +678,17 @@
                     // SUCCESS without databases -> AUTHENTICATED
                     await saveConfigWithState(ConnectionState.AUTHENTICATED);
                     log('Connection test successful - Authenticated!');
+
+                    // Send CONFIG_UPDATE message to plugin.js
+                    try {
+                        const response = await sendMessage({
+                            type: 'CONFIG_UPDATE',
+                            config: pluginConfig
+                        });
+                        log('Config update message sent (AUTHENTICATED): ' + JSON.stringify(response));
+                    } catch (error) {
+                        log(`Failed to send config update (non-critical): ${error.message}`, 'warn');
+                    }
 
                     if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
                         PluginAPI.showSnack({
@@ -591,6 +704,17 @@
                     // API worked but databases failed -> fallback to AUTHENTICATED
                     await saveConfigWithState(ConnectionState.AUTHENTICATED);
                     log('API authentication succeeded, but database test failed. State: AUTHENTICATED');
+
+                    // Send CONFIG_UPDATE message to plugin.js
+                    try {
+                        const response = await sendMessage({
+                            type: 'CONFIG_UPDATE',
+                            config: pluginConfig
+                        });
+                        log('Config update message sent (fallback AUTHENTICATED): ' + JSON.stringify(response));
+                    } catch (msgError) {
+                        log(`Failed to send config update (non-critical): ${msgError.message}`, 'warn');
+                    }
                 } else {
                     // API failed -> fallback to INITIAL
                     pluginConfig.apiKey = ''; // Clear invalid API key
@@ -598,6 +722,17 @@
                     pluginConfig.projectsDatabaseId = ''; // Clear invalid Projects database ID
                     await saveConfigWithState(ConnectionState.INITIAL);
                     log('API authentication failed. State: INITIAL');
+
+                    // Send CONFIG_UPDATE message to plugin.js
+                    try {
+                        const response = await sendMessage({
+                            type: 'CONFIG_UPDATE',
+                            config: pluginConfig
+                        });
+                        log('Config update message sent (fallback INITIAL): ' + JSON.stringify(response));
+                    } catch (msgError) {
+                        log(`Failed to send config update (non-critical): ${msgError.message}`, 'warn');
+                    }
                 }
 
                 log(`Connection test failed: ${error.message}`, 'error');
@@ -835,6 +970,17 @@
                     try {
                         await saveConfigWithState(ConnectionState.CONFIGURED);
                         log('Configuration auto-saved after database discovery - CONFIGURED');
+
+                        // Send CONFIG_UPDATE message to plugin.js
+                        try {
+                            const response = await sendMessage({
+                                type: 'CONFIG_UPDATE',
+                                config: pluginConfig
+                            });
+                            log('Config update message sent (discovery CONFIGURED): ' + JSON.stringify(response));
+                        } catch (msgError) {
+                            log(`Failed to send config update (non-critical): ${msgError.message}`, 'warn');
+                        }
                     } catch (error) {
                         log(`Failed to auto-save configuration: ${error.message}`, 'error');
                     }
@@ -846,6 +992,17 @@
                             log('Configuration auto-saved after database discovery - AUTHENTICATED (Projects DB not found)');
                         } else {
                             log('Configuration auto-saved after database discovery - AUTHENTICATED (Tasks DB not found)');
+                        }
+
+                        // Send CONFIG_UPDATE message to plugin.js
+                        try {
+                            const response = await sendMessage({
+                                type: 'CONFIG_UPDATE',
+                                config: pluginConfig
+                            });
+                            log('Config update message sent (discovery AUTHENTICATED): ' + JSON.stringify(response));
+                        } catch (msgError) {
+                            log(`Failed to send config update (non-critical): ${msgError.message}`, 'warn');
                         }
                     } catch (error) {
                         log(`Failed to auto-save configuration: ${error.message}`, 'error');
@@ -1150,7 +1307,6 @@
                 updateUI();
 
                 log(`Configuration imported from ${file.name}`);
-                log('Please verify the configuration and save if needed');
 
                 if (typeof PluginAPI !== 'undefined' && PluginAPI.showSnack) {
                     PluginAPI.showSnack({
@@ -1208,6 +1364,14 @@
             });
         }
 
+
+        // Listen for sync complete messages from plugin.js
+        window.addEventListener('message', (event) => {
+            if (event.data?.type === 'SYNC_COMPLETE') {
+                log('Sync completed - updating last sync time');
+                 updateLastSyncTimeUI();
+            }
+        });
 
         // Initialize the UI
         function initializeUI() {

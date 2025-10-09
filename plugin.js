@@ -3,34 +3,69 @@
 
 console.log('[Notion Sync] Plugin initializing...');
 
-// Import our main sync logic
-// Note: We'll access the sync functions from the iframe's window
-let syncFunctions = null;
+// Global plugin configuration object
 let pluginConfig = null;
 
 // Configuration with defaults
 const DEFAULT_CONFIG = {
+    version: '1.0.1',
     apiKey: '',
     tasksDatabaseId: '',
     projectsDatabaseId: '',
-    configured: false,
+    connectionState: 'initial',
     enableLogging: true,
     autoSyncInterval: 0 // minutes
 };
+
+function createDefaultPluginData() {
+    return {
+        config: DEFAULT_CONFIG,
+        metadata: {
+            lastModified: new Date().toISOString()
+        }
+    };
+}
 
 // Auto-sync timer
 let autoSyncTimer = null;
 let lastSyncTime = 0;
 const MIN_SYNC_INTERVAL = 5000; // 5 seconds minimum between syncs
-const PLUGIN_DATA_VERSION = '1.0.0';
+
+// Single task sync debouncing
+const taskUpdateTimeouts = new Map(); // taskId -> timeout
+const TASK_UPDATE_DEBOUNCE = 2000; // 2 seconds debounce for task updates
+
+// ===== LOGGING =====
+
+function log(message, type = 'info') {
+    if (!pluginConfig || !pluginConfig.enableLogging) return; // Skip logging if disabled
+
+    const timestamp = new Date().toLocaleTimeString();
+    if (type === 'error') {
+        console.error(`[Notion Sync] ${message}`);
+    } else if (type === 'warning') {
+        console.warn(`[Notion Sync] ${message}`);
+    } else {
+        console.log(`[Notion Sync] ${message}`);
+    }
+}
 
 // ===== INITIALIZATION =====
 
 async function initializePlugin() {
     try {
-        console.log('[Notion Sync] Loading plugin configuration...');
+        log('Loading plugin configuration...');
 
-        // Load configuration
+        // Register message handler FIRST (before loading config)
+        PluginAPI.onMessage(async (message) => {
+            if (message.type === 'CONFIG_UPDATE') {
+                return await handleConfigUpdate(message.config);
+            }
+            return { success: false, error: 'Unknown message type' };
+        });
+        log('Message handler registered');
+
+        // Load configuration ONCE from persistent storage
         const configurationLoaded = await loadConfiguration();
 
         if (!configurationLoaded) {
@@ -56,26 +91,64 @@ async function initializePlugin() {
         // Register app lifecycle hooks
         registerAppHooks();
 
-        // Start auto-sync if enabled
-        if (pluginConfig.autoSyncInterval > 0 && pluginConfig.configured) {
-            console.log('[Notion Sync] Starting initial auto-sync...');
+        // Start auto-sync if enabled and configured
+        if (pluginConfig.connectionState === 'configured' && pluginConfig.autoSyncInterval > 0) {
+            log('System configured - starting auto-sync');
+            log('State:', pluginConfig.connectionState);
+            log('Interval:', pluginConfig.autoSyncInterval, 'minutes');
             startAutoSync();
         } else {
-            console.log('[Notion Sync] Auto-sync not started - interval:', pluginConfig.autoSyncInterval, 'configured:', pluginConfig.configured);
+            log('Auto-sync not started - waiting for configuration');
+            log('State:', pluginConfig.connectionState);
+            log('Interval:', pluginConfig.autoSyncInterval, 'minutes');
         }
 
-        // Start monitoring for configuration changes
-        startConfigurationMonitoring();
-
-        console.log('[Notion Sync] Plugin initialized successfully');
+        log('Plugin initialized successfully');
 
     } catch (error) {
-        console.error('[Notion Sync] Plugin initialization failed:', error);
+        log('Plugin initialization failed:', 'error');
         PluginAPI.showSnack({
             msg: `Notion Sync initialization failed: ${error.message}`,
             type: 'ERROR'
         });
     }
+}
+
+// Handle CONFIG_UPDATE messages from index.html
+async function handleConfigUpdate(newConfig) {
+    if (newConfig.enableLogging) {
+        log('===== CONFIG UPDATE RECEIVED =====');
+        log(`Previous state: ${pluginConfig?.connectionState}`);
+        log(`New state: ${newConfig.connectionState}`);
+        log(`Previous interval: ${pluginConfig?.autoSyncInterval} min`);
+        log(`New interval: ${newConfig.autoSyncInterval} min`);
+    }
+
+    // Update internal config
+    pluginConfig = newConfig;
+
+    // Always stop current auto-sync (if running)
+    stopAutoSync();
+
+    // Decision logic: Should we start auto-sync?
+    const shouldStartAutoSync =
+        pluginConfig.connectionState === 'configured' &&
+        pluginConfig.autoSyncInterval > 0;
+
+    if (shouldStartAutoSync) {
+        log('Starting auto-sync');
+        startAutoSync();
+    } else {
+        log('Auto-sync NOT started');
+        log(`  Reason: state = ${pluginConfig.connectionState}, interval = ${pluginConfig.autoSyncInterval}`);
+    }
+
+    log('===== CONFIG UPDATE COMPLETE =====');
+
+    return {
+        success: true,
+        autoSyncStarted: shouldStartAutoSync
+    };
 }
 
 // ===== MANUAL SYNC BUTTON =====
@@ -85,11 +158,11 @@ function registerManualSyncButton() {
         label: 'Sync Notion',
         icon: 'sync',
         onClick: async () => {
-            console.log('[Notion Sync] Manual sync button clicked');
+            log('Manual sync button clicked');
             await performManualSync();
         }
     });
-    console.log('[Notion Sync] Manual sync header button registered');
+    log('Manual sync header button registered');
 }
 
 // ===== CONFIGURATION MANAGEMENT =====
@@ -128,33 +201,14 @@ async function loadConfiguration() {
     }
 }
 
-function createDefaultPluginData() {
-    return {
-        version: PLUGIN_DATA_VERSION,
-        config: {
-            apiKey: '',
-            tasksDatabaseId: '',
-            projectsDatabaseId: '',
-            configured: false,
-            enableLogging: false,
-            autoSyncInterval: 0 // minutes
-        },
-        metadata: {
-            lastSyncTime: null,
-            totalSyncs: 0,
-            lastModified: new Date().toISOString()
-        }
-    };
-}
-
 // ===== TASK HOOKS =====
 
 function registerTaskHooks() {
     // Hook for task completion
     PluginAPI.registerHook(PluginAPI.Hooks.TASK_COMPLETE, async (payload) => {
-        if (!pluginConfig.configured || !pluginConfig.enableLogging) return;
+        if (pluginConfig.connectionState !== 'configured') return;
 
-        console.log('[Notion Sync] Task completed:', payload.taskId);
+        log(`Task completed: ${payload.taskId}`);
 
         // Trigger a targeted sync for this specific task
         await syncSingleTask(payload.task, 'completed');
@@ -162,9 +216,9 @@ function registerTaskHooks() {
 
     // Hook for task updates
     PluginAPI.registerHook(PluginAPI.Hooks.TASK_UPDATE, async (payload) => {
-        if (!pluginConfig.configured) return;
+        if (pluginConfig.connectionState !== 'configured') return;
 
-        console.log('[Notion Sync] Task updated:', payload.taskId);
+        log(`Task updated: ${payload.taskId}`);
 
         // Only sync if significant changes occurred
         const significantChanges = ['title', 'notes', 'isDone', 'timeEstimate', 'timeSpent', 'projectId', 'tagIds'];
@@ -173,54 +227,119 @@ function registerTaskHooks() {
         );
 
         if (hasSignificantChanges) {
-            await syncSingleTask(payload.task, 'updated');
+            // Debounce rapid updates to the same task
+            const existingTimeout = taskUpdateTimeouts.get(payload.taskId);
+            if (existingTimeout) {
+                clearTimeout(existingTimeout);
+            }
+
+            const timeout = setTimeout(async () => {
+                taskUpdateTimeouts.delete(payload.taskId);
+                await syncSingleTask(payload.task, 'updated');
+            }, TASK_UPDATE_DEBOUNCE);
+
+            taskUpdateTimeouts.set(payload.taskId, timeout);
+            log(`Task update debounced for ${TASK_UPDATE_DEBOUNCE}ms: ${payload.taskId}`);
         }
     });
 
     // Hook for task deletion
     PluginAPI.registerHook(PluginAPI.Hooks.TASK_DELETE, async (payload) => {
-        if (!pluginConfig.configured) return;
+        if (pluginConfig.connectionState !== 'configured') return;
 
-        console.log('[Notion Sync] Task deleted:', payload.taskId);
+        log(`Task deleted: ${payload.taskId}`);
 
         // Archive corresponding Notion task
         await handleTaskDeletion(payload.taskId);
     });
 
-    console.log('[Notion Sync] Task hooks registered');
+    log('Task hooks registered');
 }
 
 async function syncSingleTask(task, action) {
-    if (!pluginConfig.configured) return;
+    if (pluginConfig.connectionState !== 'configured') return;
 
     try {
-        console.log(`[Notion Sync] Syncing single task (${action}):`, task.title);
+        log(`Syncing single task (${action}): ${task.title}`);
 
-        const syncFunctions = await getSyncFunctions();
-        if (syncFunctions) {
-            // This would call a targeted sync function for a single task
-            // await syncFunctions.syncSingleTaskToNotion(task);
+        // Find the corresponding Notion page for this SP task
+        const notionPage = await findNotionPageBySpTaskId(task.id);
+
+        if (notionPage) {
+            // Update existing Notion page from SP task
+            log('Found existing Notion page, updating from SP task');
+            await updateNotionFromSp(task, notionPage);
+            log(`Successfully updated Notion page for task: ${task.title}`);
+        } else {
+            // Create new Notion page for this SP task
+            log('No Notion page found, creating new one');
+            await createNotionTaskFromSp(task);
+            log(`Successfully created Notion page for task: ${task.title}`);
         }
 
     } catch (error) {
-        console.error('[Notion Sync] Failed to sync single task:', error);
+        log(`Failed to sync single task: ${error.message}`, 'error');
     }
 }
 
 async function handleTaskDeletion(taskId) {
-    if (!pluginConfig.configured) return;
+    if (pluginConfig.connectionState !== 'configured') return;
 
     try {
-        console.log('[Notion Sync] Handling task deletion:', taskId);
+        log(`Handling task deletion: ${taskId}`);
 
-        const syncFunctions = await getSyncFunctions();
-        if (syncFunctions) {
-            // This would call a function to archive the corresponding Notion task
-            // await syncFunctions.archiveNotionTaskBySpId(taskId);
+        // Find the corresponding Notion page for this deleted SP task
+        const notionPage = await findNotionPageBySpTaskId(taskId);
+
+        if (notionPage) {
+            // Archive the corresponding Notion page
+            log('Found Notion page for deleted task, archiving it');
+            await updateNotionTask(notionPage.id, {
+                'Archived': { checkbox: true },
+                'Status': { status: { name: 'Aborted' } }
+            });
+            log(`Successfully archived Notion page for deleted task: ${taskId}`);
+        } else {
+            log(`No Notion page found for deleted task: ${taskId}`);
         }
 
     } catch (error) {
-        console.error('[Notion Sync] Failed to handle task deletion:', error);
+        log(`Failed to handle task deletion: ${error.message}`, 'error');
+    }
+}
+
+// ===== SINGLE TASK HELPER FUNCTIONS =====
+
+// Find a Notion page by SP Task ID
+async function findNotionPageBySpTaskId(spTaskId) {
+    try {
+        const response = await fetch(`https://api.notion.com/v1/databases/${pluginConfig.tasksDatabaseId}/query`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${pluginConfig.apiKey}`,
+                'Notion-Version': '2022-06-28',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                filter: {
+                    property: 'SP Task ID',
+                    rich_text: { equals: spTaskId }
+                }
+            })
+        });
+
+        if (!response.ok) {
+            throw new Error(`Notion API error: ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        // Return the first matching page, or null if none found
+        return data.results && data.results.length > 0 ? data.results[0] : null;
+
+    } catch (error) {
+        log(`Error finding Notion page by SP Task ID: ${error.message}`, 'error');
+        return null;
     }
 }
 
@@ -229,43 +348,25 @@ async function handleTaskDeletion(taskId) {
 function registerAppHooks() {
     // Hook for when the day is finished
     PluginAPI.registerHook(PluginAPI.Hooks.FINISH_DAY, async (payload) => {
-        if (!pluginConfig.configured) return;
+        if (pluginConfig.connectionState !== 'configured') return;
 
-        console.log('[Notion Sync] Day finished, performing sync...');
+        log('Day finished, performing sync...');
 
         try {
             await performAutoSync();
         } catch (error) {
-            console.error('[Notion Sync] End-of-day sync failed:', error);
+            log(`End-of-day sync failed: ${error.message}`, 'error');
         }
     });
 
-    // Hook for window focus changes (to sync when app regains focus)
-    if (PluginAPI.onWindowFocusChange) {
-        PluginAPI.onWindowFocusChange(async (isFocused) => {
-            if (isFocused && pluginConfig.configured && pluginConfig.autoSyncInterval > 0) {
-                // Only sync on focus if auto-sync is enabled and enough time has passed
-                const timeSinceLastSync = Date.now() - lastSyncTime;
-                const autoSyncIntervalMs = pluginConfig.autoSyncInterval * 60 * 1000;
-
-                if (timeSinceLastSync > autoSyncIntervalMs) {
-                    console.log('[Notion Sync] App regained focus after long absence, performing auto-sync...');
-                    setTimeout(() => performAutoSync(), 2000); // Delay to let app settle
-                } else {
-                    console.log('[Notion Sync] App regained focus but sync was recent, skipping');
-                }
-            }
-        });
-    }
-
-    console.log('[Notion Sync] App lifecycle hooks registered');
+    log('App lifecycle hooks registered');
 }
 
 // ===== AUTO-SYNC FUNCTIONALITY =====
 
 function startAutoSync() {
-    if (!pluginConfig.configured || pluginConfig.autoSyncInterval <= 0) {
-        console.log('[Notion Sync] Cannot start auto-sync: not configured or interval is 0');
+    if (pluginConfig.connectionState !== 'configured' || pluginConfig.autoSyncInterval <= 0) {
+        log('Cannot start auto-sync: not configured or interval is 0');
         return;
     }
 
@@ -275,27 +376,27 @@ function startAutoSync() {
 
     // Safety check: minimum 1 minute interval
     if (intervalMs < 60000) {
-        console.log('[Notion Sync] Auto-sync interval too small, using minimum 1 minute');
+        log('Auto-sync interval too small, using minimum 1 minute');
         intervalMs = 60000; // 1 minute minimum
     }
 
     autoSyncTimer = setInterval(async () => {
-        if (pluginConfig.configured && pluginConfig.autoSyncInterval > 0) {
+        if (pluginConfig.connectionState === 'configured' && pluginConfig.autoSyncInterval > 0) {
             // Use performAutoSync with proper auto-sync logging
             await performAutoSync();
         }
     }, intervalMs);
 
-    console.log(`[Notion Sync] Auto-sync started with ${pluginConfig.autoSyncInterval} minute interval (${intervalMs}ms)`);
+    log(`Auto-sync started with ${pluginConfig.autoSyncInterval} minute interval (${intervalMs}ms)`);
 }
 
 function stopAutoSync() {
     if (autoSyncTimer) {
         clearInterval(autoSyncTimer);
         autoSyncTimer = null;
-        console.log('[Notion Sync] Auto-sync stopped and timer cleared');
+        log('Auto-sync stopped and timer cleared');
     } else {
-        console.log('[Notion Sync] stopAutoSync called but no timer was active');
+        log('stopAutoSync called but no timer was active');
     }
 }
 
@@ -304,7 +405,7 @@ function stopAutoSync() {
 
 // New simplified bidirectional sync function
 async function performBidirectionalSync() {
-    if (!pluginConfig.apiKey || !pluginConfig.tasksDatabaseId || !pluginConfig.configured) {
+    if (!pluginConfig.apiKey || !pluginConfig.tasksDatabaseId || pluginConfig.connectionState !== 'configured') {
         throw new Error('Plugin not configured properly');
     }
 
@@ -486,26 +587,65 @@ async function performBidirectionalSync() {
 
     // Save update sync metadata
     await updateSyncMetadata({
-        lastSyncTime: new Date().toISOString(),
-        totalSyncs: (await loadPluginData()).metadata.totalSyncs + 1
+        lastSyncTime: new Date().toISOString()
     });
 
-    /**
-     * Update sync metadata (last sync time, total syncs, etc.)
-     */
-    async function updateSyncMetadata(metadataUpdates) {
-        const currentData = await loadPluginData();
-        return await savePluginData({
-            metadata: {
-                ...currentData.metadata,
-                ...metadataUpdates,
-                lastModified: new Date().toISOString()
-            }
-        });
-    }
-
     log('=== Sync Complete ===');
+
+    // Notify UI that sync completed
+    notifyUI({ type: 'SYNC_COMPLETE', stats });
+
     return stats;
+}
+
+/**
+ * Update sync metadata (last sync time, total syncs, etc.)
+ */
+async function updateSyncMetadata(metadataUpdates) {
+    const currentData = await loadPluginData();
+    return await savePluginData({
+        metadata: {
+            ...currentData.metadata,
+            ...metadataUpdates,
+            lastModified: new Date().toISOString()
+        }
+    });
+}
+
+// Notify UI iframe about sync events
+function notifyUI(message) {
+    try {
+        // Find all iframes and send message to each
+        // (The UI will filter and only respond to relevant messages)
+        const iframes = document.querySelectorAll('iframe');
+
+        if (iframes.length === 0) {
+            log('No iframes found to notify');
+            return;
+        }
+
+        let notified = false;
+        for (const iframe of iframes) {
+            try {
+                // Check if iframe has contentWindow (is accessible)
+                if (iframe.contentWindow) {
+                    iframe.contentWindow.postMessage(message, '*');
+                    notified = true;
+                }
+            } catch (err) {
+                // Skip iframes we can't access (cross-origin)
+                continue;
+            }
+        }
+
+        if (notified) {
+            log(`Notified UI: ${message.type}`);
+        } else {
+            log('Could not notify any iframe');
+        }
+    } catch (error) {
+        log(`Failed to notify UI: ${error.message}`, 'error');
+    }
 }
 
 // ===== PROJECT/TAG SYNC FUNCTIONS =====
@@ -1598,68 +1738,19 @@ async function archiveNotionTask(pageId) {
     return await response.json();
 }
 
-// ===== CONFIGURATION MONITORING =====
-
-// Monitor configuration changes to start/stop auto-sync
-let configMonitorTimer = null;
-let lastConfigState = null;
-
-function startConfigurationMonitoring() {
-    if (configMonitorTimer) return; // Already running
-
-    console.log('[Notion Sync] Starting configuration monitoring...');
-
-    configMonitorTimer = setInterval(async () => {
-        try {
-            const currentData = await loadPluginData();
-            if (!currentData) return;
-
-            const currentConfig = currentData.config;
-
-            // Check if this is the first run or config has ACTUALLY changed
-            const hasRealChange = !lastConfigState ||
-                lastConfigState.configured !== currentConfig.configured ||
-                lastConfigState.autoSyncInterval !== currentConfig.autoSyncInterval;
-
-            if (hasRealChange) {
-                    console.log('[Notion Sync] Configuration changed, updating auto-sync...');
-                    console.log(`[Notion Sync] Old autoSyncInterval: ${lastConfigState?.autoSyncInterval}, New: ${currentConfig.autoSyncInterval}`);
-                    console.log(`[Notion Sync] Old configured: ${lastConfigState?.configured}, New: ${currentConfig.configured}`);
-
-                    // Update plugin config
-                    pluginConfig = currentConfig;
-
-                    // Stop current auto-sync
-                    stopAutoSync();
-
-                    // Start auto-sync if conditions are met
-                    if (currentConfig.autoSyncInterval > 0 && currentConfig.configured) {
-                        startAutoSync();
-                    }
-                // Update last known state
-                lastConfigState = { ...currentConfig };
-            }
-        } catch (error) {
-            console.error('[Notion Sync] Error monitoring configuration:', error);
-        }
-    }, 120000); // Check every 2 minutes
-}
-
-function stopConfigurationMonitoring() {
-    if (configMonitorTimer) {
-        clearInterval(configMonitorTimer);
-        configMonitorTimer = null;
-        console.log('[Notion Sync] Configuration monitoring stopped');
-    }
-}
-
 // ===== CLEANUP =====
 
 // Register cleanup for when the plugin is disabled or app closes
 function cleanup() {
     stopAutoSync();
-    stopConfigurationMonitoring();
-    console.log('[Notion Sync] Plugin cleanup completed');
+
+    // Clear all pending task update timeouts
+    for (const [taskId, timeout] of taskUpdateTimeouts.entries()) {
+        clearTimeout(timeout);
+    }
+    taskUpdateTimeouts.clear();
+
+    log('Plugin cleanup completed');
 }
 
 // Hook into app shutdown if available
@@ -1677,20 +1768,20 @@ if (typeof window !== 'undefined') {
 async function loadPluginData() {
     try {
         if (typeof PluginAPI === 'undefined' || !PluginAPI.loadSyncedData) {
-            console.log('[Notion Sync] Plugin API not available, using defaults');
+            log('Plugin API not available, using defaults');
             return null;
         }
 
         const savedData = await PluginAPI.loadSyncedData();
         if (!savedData) {
-            console.log('[Notion Sync] No saved data found, creating defaults');
+            log('No saved data found, creating defaults');
             return createDefaultPluginData();
         }
 
         return JSON.parse(savedData);
 
     } catch (error) {
-        console.log(`[Notion Sync] Failed to load plugin data: ${error.message}`);
+        log(`Failed to load plugin data: ${error.message}`, 'error');
         return createDefaultPluginData();
     }
 }
@@ -1702,7 +1793,7 @@ async function loadPluginData() {
 async function savePluginData(updates = {}) {
     try {
         if (typeof PluginAPI === 'undefined' || !PluginAPI.persistDataSynced) {
-            console.log('[Notion Sync] Plugin API not available for saving');
+            log('Plugin API not available for saving');
             return false;
         }
 
@@ -1722,25 +1813,25 @@ async function savePluginData(updates = {}) {
 
         // Save back
         await PluginAPI.persistDataSynced(JSON.stringify(updatedData));
-        console.log('[Notion Sync] Plugin data saved successfully');
+        log('Plugin data saved successfully');
         return true;
 
     } catch (error) {
-        console.log(`[Notion Sync] Failed to save plugin data: ${error.message}`);
+        log(`Failed to save plugin data: ${error.message}`, 'error');
         return false;
     }
 }
 
 // Auto-sync function called from timer
 async function performAutoSync() {
-    if (!pluginConfig.configured) {
-        console.log('[Notion Sync] Not configured, skipping auto-sync');
+    if (pluginConfig.connectionState !== 'configured') {
+        log('Not configured, skipping auto-sync');
         return;
     }
 
     // Critical: Don't auto-sync if interval is 0 (disabled)
     if (pluginConfig.autoSyncInterval <= 0) {
-        console.log('[Notion Sync] Auto-sync disabled (interval = 0), skipping');
+        log('Auto-sync disabled (interval = 0), skipping');
         return;
     }
 
@@ -1748,12 +1839,12 @@ async function performAutoSync() {
     const now = Date.now();
     if (now - lastSyncTime < MIN_SYNC_INTERVAL) {
         const remainingTime = Math.ceil((MIN_SYNC_INTERVAL - (now - lastSyncTime)) / 1000);
-        console.log(`[Notion Sync] Auto-sync rate limited, wait ${remainingTime} seconds`);
+        log(`Auto-sync rate limited, wait ${remainingTime} seconds`, 'warning');
         return;
     }
 
     try {
-        console.log('[Notion Sync] Starting auto-sync...');
+        log('Starting auto-sync...');
 
         const results = await performBidirectionalSync();
         lastSyncTime = now;
@@ -1761,18 +1852,18 @@ async function performAutoSync() {
         const totalChanges = results.spToNotionCreates + results.spToNotionUpdates +
                            results.notionToSpCreates + results.notionToSpUpdates;
 
-        console.log(`[Notion Sync] Auto-sync completed: ${totalChanges} changes processed`);
+        log(`Auto-sync completed: ${totalChanges} changes processed`);
 
     } catch (error) {
-        console.error('[Notion Sync] Auto-sync failed:', error);
+        log('Auto-sync failed:', 'error');
         // Don't show UI notification for auto-sync failures to avoid spam
     }
 }
 
 // Manual sync function called from header button and UI trigger
 async function performManualSync() {
-    if (!pluginConfig.configured) {
-        console.log('[Notion Sync] Not configured, skipping sync');
+    if (pluginConfig.connectionState !== 'configured') {
+        log('Not configured, skipping sync');
         PluginAPI.showSnack({
             msg: 'Notion Sync is not configured. Please set up the plugin first.',
             type: 'WARNING',
@@ -1785,7 +1876,7 @@ async function performManualSync() {
     const now = Date.now();
     if (now - lastSyncTime < MIN_SYNC_INTERVAL) {
         const remainingTime = Math.ceil((MIN_SYNC_INTERVAL - (now - lastSyncTime)) / 1000);
-        console.log(`[Notion Sync] Rate limited, wait ${remainingTime} seconds`);
+        log(`Rate limited, wait ${remainingTime} seconds`, 'warning');
 
         PluginAPI.showSnack({
             msg: `Please wait ${remainingTime} seconds before syncing again`,
@@ -1795,7 +1886,7 @@ async function performManualSync() {
     }
 
     try {
-        console.log('[Notion Sync] Starting manual sync...');
+        log('Starting manual sync...');
 
         PluginAPI.showSnack({
             msg: 'Starting Notion sync...',
@@ -1815,20 +1906,14 @@ async function performManualSync() {
             ico: 'check_circle'
         });
 
-        console.log('[Notion Sync] Manual sync completed:', results);
+        log('Manual sync completed:', results);
 
     } catch (error) {
-        console.error('[Notion Sync] Manual sync failed:', error);
+        log('Manual sync failed:', 'error');
         PluginAPI.showSnack({
             msg: `Sync failed: ${error.message}`,
             type: 'ERROR'
         });
-    }
-}
-
-function log(message, type = 'info') {
-    if (pluginConfig && pluginConfig.enableLogging) {
-        console.log(`[Notion Sync] ${message}`);
     }
 }
 
